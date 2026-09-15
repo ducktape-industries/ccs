@@ -45,6 +45,11 @@ const CODEX_PREFIX: &str = "/backend-api";
 /// What pi keys on to treat a key as an OAuth token, plus a mark of its own.
 const KEY_PREFIX: &str = "sk-ant-oat-ccs-";
 
+/// The header a client pins one request to one account with: a slug, an
+/// email, or an unambiguous prefix of either, read the way `ccs use` reads
+/// one. A pinned request ignores the account in use and the pool both.
+pub const PIN_HEADER: &str = "x-ccs-account";
+
 /// Bodies are held whole so a limited request can be tried again on another
 /// account. Anything past this is not a conversation.
 const MAX_BODY: usize = 64 * 1024 * 1024;
@@ -54,12 +59,14 @@ const MAX_BODY: usize = 64 * 1024 * 1024;
 /// credentials go with them, since the account's replace them, and its accepted
 /// encodings, since the reply is passed on as bytes and has to arrive as such.
 /// `expect` in particular would have the client's `100-continue` waited out
-/// upstream, on a body that has already been read whole here.
-const NOT_FORWARDED: [&str; 15] = [
+/// upstream, on a body that has already been read whole here. The pin is
+/// this gateway's own and means nothing to the API.
+const NOT_FORWARDED: [&str; 16] = [
     "host",
     "authorization",
     "x-api-key",
     "chatgpt-account-id",
+    PIN_HEADER,
     "proxy-authorization",
     "content-length",
     "transfer-encoding",
@@ -292,17 +299,27 @@ pub struct Grant {
 /// stash answers.
 pub trait Accounts {
     /// An account of `provider` other than those in `avoid`, which have been
-    /// found limited for the request in hand. The error is for the client.
-    fn grant(&self, provider: Provider, avoid: &[String]) -> Result<Grant, String>;
+    /// found limited for the request in hand. With a `pin`, the one account
+    /// that names, or an error saying why there is no such account. The
+    /// error is for the client.
+    fn grant(
+        &self,
+        provider: Provider,
+        pin: Option<&str>,
+        avoid: &[String],
+    ) -> Result<Grant, String>;
 
+    /// As `grant`, with the model asked for, which a route may send to an
+    /// account of its own. A pin outranks a route.
     fn grant_model(
         &self,
         provider: Provider,
         model: Option<&str>,
+        pin: Option<&str>,
         avoid: &[String],
     ) -> Result<Grant, String> {
         let _ = model;
-        self.grant(provider, avoid)
+        self.grant(provider, pin, avoid)
     }
 
     /// The server refused `grant`'s token. A newer one for the same account,
@@ -408,6 +425,11 @@ fn route(target: &str) -> Option<(Provider, &str)> {
 /// relay whatever comes back — unless what comes back is a limit and the pool
 /// has another account to try, or a rejected token that can be renewed.
 ///
+/// A request pinned to an account goes out as that account and no other: a
+/// limit on it is relayed rather than fallen over, since the client asked
+/// for that account and not for whichever has room. Renewal still applies;
+/// that is the same account with a fresher token.
+///
 /// Every retry happens before a byte reaches the client, which is what makes
 /// it invisible.
 pub fn answer(
@@ -437,10 +459,19 @@ pub fn answer(
     // Read only the routing key; forward the original bytes without modification.
     let body: Option<serde_json::Value> = serde_json::from_slice(&request.body).ok();
     let model = body.as_ref().and_then(|v| v.get("model")).and_then(|v| v.as_str());
+    let pin = request.header(PIN_HEADER).map(str::trim).filter(|p| !p.is_empty());
     let mut outcome = Outcome::refused(0);
+    outcome.pinned = pin.is_some();
     let mut renewed: Vec<String> = Vec::new();
-    let mut grant = match accounts.grant_model(provider, model, &outcome.tried) {
+    let mut grant = match accounts.grant_model(provider, model, pin, &outcome.tried) {
         Ok(grant) => grant,
+        // A pin that names no account is the client's mistake; no account to
+        // send as otherwise is this end's.
+        Err(why) if pin.is_some() => {
+            write_error(out, 400, "invalid_request_error", &why)?;
+            outcome.status = 400;
+            return Ok(outcome);
+        }
         Err(why) => {
             write_error(out, 503, "api_error", &why)?;
             return Ok(Outcome::refused(503));
@@ -458,9 +489,9 @@ pub fn answer(
             }
         };
         match reply.status {
-            429 => {
+            429 if pin.is_none() => {
                 outcome.tried.push(grant.slug.clone());
-                match accounts.grant_model(provider, model, &outcome.tried) {
+                match accounts.grant_model(provider, model, pin, &outcome.tried) {
                     Ok(next) => {
                         grant = next;
                         continue;
@@ -496,6 +527,8 @@ pub struct Outcome {
     pub status: u16,
     /// The account it went out as, when it went out at all.
     pub slug: Option<String>,
+    /// Whether the client named that account itself.
+    pub pinned: bool,
     /// Accounts found limited along the way.
     pub tried: Vec<String>,
     /// Why the stash could not help further, when it was asked and could not:
@@ -506,7 +539,7 @@ pub struct Outcome {
 
 impl Outcome {
     fn refused(status: u16) -> Self {
-        Self { status, slug: None, tried: Vec::new(), failed: None }
+        Self { status, slug: None, pinned: false, tried: Vec::new(), failed: None }
     }
 }
 
@@ -517,6 +550,7 @@ pub enum Ask {
     Grant {
         provider: Provider,
         model: Option<String>,
+        pin: Option<String>,
         avoid: Vec<String>,
         reply: Sender<Result<Grant, String>>,
     },
@@ -530,8 +564,13 @@ impl Ask {
     pub fn answer(self, accounts: &dyn Accounts) {
         // A connection that gave up waiting is not an error worth anything.
         match self {
-            Self::Grant { provider, model, avoid, reply } => {
-                drop(reply.send(accounts.grant_model(provider, model.as_deref(), &avoid)))
+            Self::Grant { provider, model, pin, avoid, reply } => {
+                drop(reply.send(accounts.grant_model(
+                    provider,
+                    model.as_deref(),
+                    pin.as_deref(),
+                    &avoid,
+                )))
             }
             Self::Stale { grant, reply } => drop(reply.send(accounts.stale(&grant))),
         }
@@ -545,14 +584,20 @@ struct Line(Sender<Ask>);
 const GONE: &str = "the stash is no longer answering";
 
 impl Accounts for Line {
-    fn grant(&self, provider: Provider, avoid: &[String]) -> Result<Grant, String> {
-        self.grant_model(provider, None, avoid)
+    fn grant(
+        &self,
+        provider: Provider,
+        pin: Option<&str>,
+        avoid: &[String],
+    ) -> Result<Grant, String> {
+        self.grant_model(provider, None, pin, avoid)
     }
 
     fn grant_model(
         &self,
         provider: Provider,
         model: Option<&str>,
+        pin: Option<&str>,
         avoid: &[String],
     ) -> Result<Grant, String> {
         let (reply, answer) = mpsc::channel();
@@ -560,6 +605,7 @@ impl Accounts for Line {
             .send(Ask::Grant {
                 provider,
                 model: model.map(str::to_owned),
+                pin: pin.map(str::to_owned),
                 avoid: avoid.to_vec(),
                 reply,
             })
@@ -686,6 +732,9 @@ fn logged(request: &Request, outcome: &Outcome, took: std::time::Duration) -> St
     let mut line = format!("{stamp} {} {path} {}", request.method, outcome.status);
     if let Some(slug) = &outcome.slug {
         line.push_str(&format!(" as {slug}"));
+        if outcome.pinned {
+            line.push_str(" (pinned)");
+        }
     }
     if !outcome.tried.is_empty() {
         line.push_str(&format!(" ({} limited)", outcome.tried.join(", ")));
@@ -860,6 +909,7 @@ mod tests {
              Expect: 100-continue\r\n\
              TE: trailers\r\n\
              Proxy-Authorization: Basic x\r\n\
+             X-CCS-Account: work\r\n\
              anthropic-beta: oauth-2025-04-20\r\n\
              User-Agent: claude-cli/2.0.0\r\n\
              \r\n{}",
@@ -1001,12 +1051,14 @@ mod tests {
         (Upstream::new(&base), seen)
     }
 
-    /// Accounts handed out in order, remembering what was asked.
+    /// Accounts handed out in order, remembering what was asked. A pin is
+    /// looked up by slug among the grants, as the desk would resolve one.
     #[derive(Default)]
     struct Pool {
         grants: Vec<Grant>,
         asked_to_avoid: RefCell<Vec<Vec<String>>>,
         asked_for: RefCell<Vec<Provider>>,
+        asked_to_pin: RefCell<Vec<Option<String>>>,
         marked_stale: RefCell<Vec<String>>,
         /// What a stale report on each account is answered with, when anything.
         renewed: Vec<Grant>,
@@ -1029,9 +1081,23 @@ mod tests {
     }
 
     impl Accounts for Pool {
-        fn grant(&self, provider: Provider, avoid: &[String]) -> Result<Grant, String> {
+        fn grant(
+            &self,
+            provider: Provider,
+            pin: Option<&str>,
+            avoid: &[String],
+        ) -> Result<Grant, String> {
             self.asked_to_avoid.borrow_mut().push(avoid.to_vec());
             self.asked_for.borrow_mut().push(provider);
+            self.asked_to_pin.borrow_mut().push(pin.map(str::to_owned));
+            if let Some(needle) = pin {
+                return self
+                    .grants
+                    .iter()
+                    .find(|g| g.provider == provider && g.slug == needle)
+                    .cloned()
+                    .ok_or_else(|| format!("no such account for {provider}: {needle}"));
+            }
             if let (false, Some(why)) = (avoid.is_empty(), &self.broken) {
                 return Err(why.clone());
             }
@@ -1052,13 +1118,14 @@ mod tests {
     fn concurrent_main_and_subagent_requests_keep_their_models_and_credentials() {
         struct ModelAccounts;
         impl Accounts for ModelAccounts {
-            fn grant(&self, _: Provider, _: &[String]) -> Result<Grant, String> {
+            fn grant(&self, _: Provider, _: Option<&str>, _: &[String]) -> Result<Grant, String> {
                 Ok(grant("default"))
             }
             fn grant_model(
                 &self,
                 _: Provider,
                 model: Option<&str>,
+                _: Option<&str>,
                 avoid: &[String],
             ) -> Result<Grant, String> {
                 let slug = match model {
@@ -1111,13 +1178,14 @@ mod tests {
     fn model_is_preserved_when_a_rate_limited_request_retries() {
         struct RetryAccounts(std::sync::Mutex<Vec<Option<String>>>);
         impl Accounts for RetryAccounts {
-            fn grant(&self, _: Provider, _: &[String]) -> Result<Grant, String> {
+            fn grant(&self, _: Provider, _: Option<&str>, _: &[String]) -> Result<Grant, String> {
                 unreachable!()
             }
             fn grant_model(
                 &self,
                 _: Provider,
                 model: Option<&str>,
+                _: Option<&str>,
                 avoid: &[String],
             ) -> Result<Grant, String> {
                 self.0.lock().unwrap().push(model.map(str::to_owned));
@@ -1338,6 +1406,117 @@ mod tests {
         assert_eq!(seen[0].bearer.as_deref(), Some("tok-work"));
         assert_eq!(seen[1].bearer.as_deref(), Some("tok-alt"));
         assert_eq!(*pool.asked_to_avoid.borrow(), vec![vec![], vec!["work".to_string()]]);
+    }
+
+    /// `post`, pinned to `account` the way pi does it.
+    fn pinned_post(path: &str, key: &str, account: &str) -> Request {
+        let mut request = post(path, key);
+        request.headers.push((PIN_HEADER.into(), account.into()));
+        request
+    }
+
+    #[test]
+    fn a_pinned_request_goes_out_as_the_account_it_names_whatever_is_in_use() {
+        let (up, seen) = upstream(vec![(200, r#"{"id":"msg"}"#)]);
+        let pool = Pool { grants: vec![grant("work"), grant("alt")], ..Default::default() };
+
+        let (status, body, outcome) =
+            answered_fully(&pinned_post("/v1/messages", KEY, "alt"), &up, &pool);
+
+        assert_eq!((status, body.as_str()), (200, r#"{"id":"msg"}"#));
+        let seen = seen.lock().expect("lock");
+        assert_eq!(seen[0].bearer.as_deref(), Some("tok-alt"));
+        assert!(!seen[0].headers.iter().any(|(name, _)| name == PIN_HEADER), "{:?}", seen[0]);
+        assert_eq!(*pool.asked_to_pin.borrow(), vec![Some("alt".to_string())]);
+        assert_eq!(outcome.slug.as_deref(), Some("alt"));
+        assert!(outcome.pinned);
+    }
+
+    #[test]
+    fn a_pinned_request_that_is_limited_is_relayed_rather_than_fallen_over() {
+        let (up, seen) = upstream(vec![(429, r#"{"rate":"limited"}"#)]);
+        let pool = Pool { grants: vec![grant("work"), grant("alt")], ..Default::default() };
+
+        let (status, body, outcome) =
+            answered_fully(&pinned_post("/v1/messages", KEY, "work"), &up, &pool);
+
+        assert_eq!((status, body.as_str()), (429, r#"{"rate":"limited"}"#));
+        assert_eq!(seen.lock().expect("lock").len(), 1);
+        assert_eq!(pool.asked_to_avoid.borrow().len(), 1);
+        assert_eq!(
+            outcome,
+            Outcome {
+                status: 429,
+                slug: Some("work".into()),
+                pinned: true,
+                tried: vec![],
+                failed: None,
+            }
+        );
+    }
+
+    #[test]
+    fn a_pinned_request_still_has_its_token_renewed() {
+        let (up, seen) = upstream(vec![(401, r#"{"auth":"no"}"#), (200, r#"{"id":"ok"}"#)]);
+        let pool = Pool {
+            grants: vec![grant("work"), grant("alt")],
+            renewed: vec![renewed("alt")],
+            ..Default::default()
+        };
+
+        let (status, _) = answered(&pinned_post("/v1/messages", KEY, "alt"), &up, &pool);
+
+        assert_eq!(status, 200);
+        let seen = seen.lock().expect("lock");
+        assert_eq!(seen[0].bearer.as_deref(), Some("tok-alt"));
+        assert_eq!(seen[1].bearer.as_deref(), Some("tok-alt-2"));
+    }
+
+    #[test]
+    fn a_pin_that_names_no_account_is_the_clients_mistake() {
+        let (up, seen) = upstream(vec![]);
+        let pool = Pool { grants: vec![grant("work")], ..Default::default() };
+
+        let (status, body, outcome) =
+            answered_fully(&pinned_post("/v1/messages", KEY, "nobody"), &up, &pool);
+
+        assert_eq!(status, 400);
+        assert!(body.contains("invalid_request_error"), "{body}");
+        assert!(body.contains("no such account for claude: nobody"), "{body}");
+        assert!(seen.lock().expect("lock").is_empty());
+        assert_eq!(outcome.slug, None);
+    }
+
+    #[test]
+    fn a_pin_on_the_codex_route_is_resolved_among_codex_accounts() {
+        let (up, seen) = upstream(vec![(200, "{}")]);
+        let pool = Pool {
+            grants: vec![grant("alt"), codex_grant("work"), codex_grant("alt")],
+            ..Default::default()
+        };
+        let mut request = codex_post("/backend-api/codex/responses", CODEX_KEY);
+        request.headers.push((PIN_HEADER.into(), "alt".into()));
+
+        let (status, _) = answered(&request, &up, &pool);
+
+        assert_eq!(status, 200);
+        assert_eq!(*pool.asked_for.borrow(), vec![Provider::Codex]);
+        let seen = seen.lock().expect("lock");
+        assert_eq!(seen[0].bearer.as_deref(), Some("tok-alt"));
+        assert!(seen[0].headers.contains(&("chatgpt-account-id".into(), "acct-alt".into())));
+    }
+
+    #[test]
+    fn the_log_line_says_when_the_client_named_the_account() {
+        let outcome = Outcome { slug: Some("work".into()), pinned: true, ..Outcome::refused(200) };
+
+        let line = logged(
+            &post("/v1/messages?beta=true", KEY),
+            &outcome,
+            std::time::Duration::from_secs(2),
+        );
+
+        assert!(line.ends_with("POST /v1/messages 200 as work (pinned) 2.0s"), "{line}");
     }
 
     #[test]

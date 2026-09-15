@@ -57,7 +57,9 @@ the API — [pi](https://pi.dev) through its `models.json`, say — gets every
 account you have stashed and never logs in itself; `ccs use`, the picker and
 `ccs watch --rotate` move it along with your sessions. With a `--rotate` pool of
 its own, a request the account in use is too limited to answer is quietly sent
-again as the next pooled account. See below.
+again as the next pooled account. A session that would rather not move sends
+`x-ccs-account: <account>` on each request and is pinned to that account, the
+way `ccs pin` pins a Claude Code terminal. See below.
 
 **Codex accounts too.** Choose Codex in `ccs add` to stash a ChatGPT login for Codex
 CLI the same way, and the table, picker, watcher, menu bar app and gateway
@@ -343,6 +345,15 @@ status line can keep the answer in front of you without asking the network.
 Run several at once, one terminal each, and you are working three accounts in
 parallel with three separate limit budgets.
 
+A pi session going through the gateway has no terminal of its own to pin, so it
+pins each request instead: an `x-ccs-account: <account>` header, naming an
+account the way `ccs use` does — slug, email, or an unambiguous prefix of
+either — sends that request out as that account, whatever is in use. `ccs use`
+leaves such a session where it is. The pin is strict: a pinned account that is
+limited answers `429`, rather than falling over to the `--rotate` pool, because
+the session asked for that account and not for whichever has room. A header
+naming no account is a `400`, and the header itself never goes upstream.
+
 ### What a pinned session shares, and what it doesn't
 
 A pinned session is a normal session in every way but one. It gets a *pen* — a
@@ -407,7 +418,8 @@ never leaves the machine.
 
 A request the API turns away with a `429` is, when `--rotate` names a pool, sent
 again as the first pooled account not yet found limited, before a byte has
-reached the client. Without a pool the `429` is relayed as it is. A `401` on a
+reached the client. Without a pool, or on a request pinned with `x-ccs-account`,
+the `429` is relayed as it is. A `401` on a
 token this tool thought was fresh is taken for a session having refreshed the
 live credentials underneath it; the copies are brought level and the request
 sent once more.
