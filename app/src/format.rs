@@ -2,7 +2,7 @@
 //! from the accounts. Deterministic, effect-free, and tested here rather than
 //! through a window.
 
-use crate::backend::{Account, PoolEntry};
+use crate::backend::Account;
 
 /// What the menu bar shows: the active Claude account's session, since that
 /// is the window that runs out within a working day.
@@ -12,17 +12,6 @@ pub fn bar_label(accounts: &[Account]) -> String {
         .find(|a| a.active && a.provider == "claude" && a.session_percent >= 0.0)
         .map(|a| percent_label(a.session_percent))
         .unwrap_or_else(|| "–".to_string())
-}
-
-/// Whether `id` is the window held, so a closed window is forgotten only
-/// when it is the one.
-pub fn is_window(held: Option<iced::window::Id>, id: iced::window::Id) -> bool {
-    held == Some(id)
-}
-
-/// Whether the account `slug` is the one in use, for tests to ask.
-pub fn active_of(accounts: &[Account], slug: String) -> bool {
-    accounts.iter().any(|a| a.slug == slug && a.active)
 }
 
 /// What the confirmation asks before switching into a spent account.
@@ -35,29 +24,9 @@ pub fn confirm_question(accounts: &[Account], slug: &str) -> String {
     }
 }
 
-/// Whether `slug` is in the rotation pool.
-pub fn in_pool(pool: &[String], slug: String) -> bool {
-    pool.contains(&slug)
-}
-
 /// Whether `port` names a port a listener can take.
 pub fn is_port(port: &str) -> bool {
     port.trim().parse::<u16>().is_ok_and(|p| p > 0)
-}
-
-/// What the gateway line says as a port is applied: a refusal when it is
-/// not one, "off" when the gateway is, and that it is coming up otherwise.
-pub fn port_line(port: &str, on: bool) -> String {
-    match (is_port(port), on) {
-        (false, _) => format!("{port:?} is not a port; 1 to 65535"),
-        (true, false) => "off".to_string(),
-        (true, true) => format!("starting on {}", port.trim()),
-    }
-}
-
-/// Whether the pool rows show `slug` ticked, for tests to ask.
-pub fn ticked_in(rows: &[PoolEntry], slug: String) -> bool {
-    rows.iter().any(|r| r.slug == slug && r.ticked)
 }
 
 /// The pool with `slug` added or taken out.
@@ -67,18 +36,6 @@ pub fn toggled(pool: &[String], slug: String, on: bool) -> Vec<String> {
         next.push(slug);
     }
     next
-}
-
-/// Every account with whether it is in the pool.
-pub fn pool_rows(accounts: &[Account], pool: &[String]) -> Vec<PoolEntry> {
-    accounts
-        .iter()
-        .map(|a| PoolEntry {
-            slug: a.slug.clone(),
-            email: a.email.clone(),
-            ticked: pool.contains(&a.slug),
-        })
-        .collect()
 }
 
 /// The pool the daemons are handed: the one ticked, only while rotation is on.
@@ -117,15 +74,6 @@ pub fn percent_label(percent: f64) -> String {
         true => "–".to_string(),
         false => format!("{}%", percent.round() as i64),
     }
-}
-
-/// The active marker, as one character.
-pub fn mark(active: bool) -> String {
-    match active {
-        true => "●",
-        false => "○",
-    }
-    .to_string()
 }
 
 #[cfg(test)]
@@ -177,27 +125,16 @@ mod tests {
             "r@x.com has nothing left on one of its limits. Switch anyway?"
         );
         assert_eq!(confirm_question(&accounts, "x"), "");
-        assert!(!active_of(&accounts, "r".into()));
     }
 
     #[test]
     fn the_pool_is_ticked_and_unticked_by_slug() {
         let pool = vec!["a".to_string()];
-        assert!(in_pool(&pool, "a".into()));
-        assert!(!in_pool(&pool, "b".into()));
         assert_eq!(toggled(&pool, "b".into(), true), ["a", "b"]);
         assert_eq!(toggled(&pool, "a".into(), false), Vec::<String>::new());
         assert_eq!(toggled(&pool, "a".into(), true), ["a"]);
         assert_eq!(pool_for(false, &pool), Vec::<String>::new());
         assert_eq!(pool_for(true, &pool), ["a"]);
-        let rows = pool_rows(
-            &[account("claude", "a", true, 5.0), account("claude", "b", false, 5.0)],
-            &pool,
-        );
-        assert_eq!(
-            rows.iter().map(|r| (r.slug.as_str(), r.ticked)).collect::<Vec<_>>(),
-            [("a", true), ("b", false)]
-        );
     }
 
     #[test]
@@ -217,10 +154,8 @@ mod tests {
     }
 
     #[test]
-    fn a_percent_is_whole_and_a_mark_is_a_dot() {
+    fn a_percent_is_whole_or_unknown() {
         assert_eq!(percent_label(52.4), "52%");
         assert_eq!(percent_label(-1.0), "–");
-        assert_eq!(mark(true), "●");
-        assert_eq!(mark(false), "○");
     }
 }

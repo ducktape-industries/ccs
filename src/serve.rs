@@ -5,7 +5,8 @@
 //! points its base URL here and presents the gateway key. pi takes any key
 //! spelled `sk-ant-oat…` for an OAuth token and does the Claude Code shaping
 //! itself: the bearer header, the OAuth betas, the identity line at the head
-//! of the system prompt. So nothing here reads a body. The client's key is
+//! of the system prompt. Routing reads the model field without altering the body.
+//! The client's key is
 //! swapped for the account's access token and the rest is relayed as it came,
 //! both ways, with the response streamed as it arrives.
 //!
@@ -294,6 +295,16 @@ pub trait Accounts {
     /// found limited for the request in hand. The error is for the client.
     fn grant(&self, provider: Provider, avoid: &[String]) -> Result<Grant, String>;
 
+    fn grant_model(
+        &self,
+        provider: Provider,
+        model: Option<&str>,
+        avoid: &[String],
+    ) -> Result<Grant, String> {
+        let _ = model;
+        self.grant(provider, avoid)
+    }
+
     /// The server refused `grant`'s token. A newer one for the same account,
     /// when one can be had; `None` when it was as fresh as they come.
     fn stale(&self, grant: &Grant) -> Result<Option<Grant>, String>;
@@ -423,9 +434,12 @@ pub fn answer(
         return Ok(Outcome::refused(401));
     }
 
+    // Read only the routing key; forward the original bytes without modification.
+    let body: Option<serde_json::Value> = serde_json::from_slice(&request.body).ok();
+    let model = body.as_ref().and_then(|v| v.get("model")).and_then(|v| v.as_str());
     let mut outcome = Outcome::refused(0);
     let mut renewed: Vec<String> = Vec::new();
-    let mut grant = match accounts.grant(provider, &outcome.tried) {
+    let mut grant = match accounts.grant_model(provider, model, &outcome.tried) {
         Ok(grant) => grant,
         Err(why) => {
             write_error(out, 503, "api_error", &why)?;
@@ -446,7 +460,7 @@ pub fn answer(
         match reply.status {
             429 => {
                 outcome.tried.push(grant.slug.clone());
-                match accounts.grant(provider, &outcome.tried) {
+                match accounts.grant_model(provider, model, &outcome.tried) {
                     Ok(next) => {
                         grant = next;
                         continue;
@@ -500,16 +514,24 @@ impl Outcome {
 
 /// A question for whoever holds the stash, with somewhere to put the answer.
 pub enum Ask {
-    Grant { provider: Provider, avoid: Vec<String>, reply: Sender<Result<Grant, String>> },
-    Stale { grant: Grant, reply: Sender<Result<Option<Grant>, String>> },
+    Grant {
+        provider: Provider,
+        model: Option<String>,
+        avoid: Vec<String>,
+        reply: Sender<Result<Grant, String>>,
+    },
+    Stale {
+        grant: Grant,
+        reply: Sender<Result<Option<Grant>, String>>,
+    },
 }
 
 impl Ask {
     pub fn answer(self, accounts: &dyn Accounts) {
         // A connection that gave up waiting is not an error worth anything.
         match self {
-            Self::Grant { provider, avoid, reply } => {
-                drop(reply.send(accounts.grant(provider, &avoid)))
+            Self::Grant { provider, model, avoid, reply } => {
+                drop(reply.send(accounts.grant_model(provider, model.as_deref(), &avoid)))
             }
             Self::Stale { grant, reply } => drop(reply.send(accounts.stale(&grant))),
         }
@@ -524,9 +546,23 @@ const GONE: &str = "the stash is no longer answering";
 
 impl Accounts for Line {
     fn grant(&self, provider: Provider, avoid: &[String]) -> Result<Grant, String> {
+        self.grant_model(provider, None, avoid)
+    }
+
+    fn grant_model(
+        &self,
+        provider: Provider,
+        model: Option<&str>,
+        avoid: &[String],
+    ) -> Result<Grant, String> {
         let (reply, answer) = mpsc::channel();
         self.0
-            .send(Ask::Grant { provider, avoid: avoid.to_vec(), reply })
+            .send(Ask::Grant {
+                provider,
+                model: model.map(str::to_owned),
+                avoid: avoid.to_vec(),
+                reply,
+            })
             .map_err(|_| GONE.to_string())?;
         answer.recv().map_err(|_| GONE.to_string())?
     }
@@ -571,6 +607,20 @@ impl Listening {
 /// `asks` ends when the last asker is gone: the accept thread's, dropped
 /// when it stops, and each connection's, dropped when it closes.
 pub fn listen(listener: TcpListener, keys: Keys, asks: Sender<Ask>) -> Listening {
+    listen_with_logging(listener, keys, asks, true)
+}
+
+/// A child client's terminal stays entirely its own.
+pub fn listen_quiet(listener: TcpListener, keys: Keys, asks: Sender<Ask>) -> Listening {
+    listen_with_logging(listener, keys, asks, false)
+}
+
+fn listen_with_logging(
+    listener: TcpListener,
+    keys: Keys,
+    asks: Sender<Ask>,
+    log_requests: bool,
+) -> Listening {
     let stop = Arc::new(AtomicBool::new(false));
     let addr = listener.local_addr().expect("a bound listener has an address");
     let flag = Arc::clone(&stop);
@@ -587,7 +637,7 @@ pub fn listen(listener: TcpListener, keys: Keys, asks: Sender<Ask>) -> Listening
             let (claude, codex) = (Arc::clone(&claude), Arc::clone(&codex));
             thread::spawn(move || {
                 let upstreams = Upstreams { claude: &claude, codex: &codex };
-                connection(stream, &keys, &upstreams, &line)
+                connection(stream, &keys, &upstreams, &line, log_requests)
             });
         }
     });
@@ -595,7 +645,13 @@ pub fn listen(listener: TcpListener, keys: Keys, asks: Sender<Ask>) -> Listening
 }
 
 /// Answer requests on one connection until the client hangs up.
-fn connection(stream: TcpStream, keys: &Keys, upstreams: &Upstreams, accounts: &dyn Accounts) {
+fn connection(
+    stream: TcpStream,
+    keys: &Keys,
+    upstreams: &Upstreams,
+    accounts: &dyn Accounts,
+    log_requests: bool,
+) {
     let Ok(read_end) = stream.try_clone() else { return };
     let mut reader = io::BufReader::new(read_end);
     let mut writer = io::BufWriter::new(stream);
@@ -610,7 +666,10 @@ fn connection(stream: TcpStream, keys: &Keys, upstreams: &Upstreams, accounts: &
         };
         let started = Instant::now();
         match answer(&request, keys, upstreams, accounts, &mut writer) {
-            Ok(outcome) => println!("{}", logged(&request, &outcome, started.elapsed())),
+            Ok(outcome) if log_requests => {
+                eprintln!("{}", logged(&request, &outcome, started.elapsed()))
+            }
+            Ok(_) => {}
             // The client went away mid-answer; there is nobody to tell.
             Err(_) => return,
         }
@@ -989,6 +1048,94 @@ mod tests {
         }
     }
 
+    #[test]
+    fn concurrent_main_and_subagent_requests_keep_their_models_and_credentials() {
+        struct ModelAccounts;
+        impl Accounts for ModelAccounts {
+            fn grant(&self, _: Provider, _: &[String]) -> Result<Grant, String> {
+                Ok(grant("default"))
+            }
+            fn grant_model(
+                &self,
+                _: Provider,
+                model: Option<&str>,
+                avoid: &[String],
+            ) -> Result<Grant, String> {
+                let slug = match model {
+                    Some("claude-opus-test") => "a",
+                    Some("claude-fable-test") => "b",
+                    _ => "default",
+                };
+                if avoid.contains(&slug.to_string()) {
+                    return Err("limited".into());
+                }
+                Ok(grant(slug))
+            }
+            fn stale(&self, _: &Grant) -> Result<Option<Grant>, String> {
+                Ok(None)
+            }
+        }
+        let handles: Vec<_> = ["claude-opus-test", "claude-fable-test"]
+            .into_iter()
+            .map(|model| {
+                std::thread::spawn(move || {
+                    let (up, seen) = upstream(vec![(200, "ok")]);
+                    let mut req = post("/v1/messages", KEY);
+                    req.body = serde_json::to_vec(
+                        &json!({"model": model, "messages": [{"role":"user","content":"test"}]}),
+                    )
+                    .unwrap();
+                    let mut out = Vec::new();
+                    answer(
+                        &req,
+                        &keys(),
+                        &Upstreams { claude: &up, codex: &up },
+                        &ModelAccounts,
+                        &mut out,
+                    )
+                    .unwrap();
+                    let seen = seen.lock().unwrap();
+                    assert_eq!(seen[0].body, req.body);
+                    let expected =
+                        if model.contains("opus") { "Bearer tok-a" } else { "Bearer tok-b" };
+                    assert!(seen[0].headers.contains(&("authorization".into(), expected.into())));
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn model_is_preserved_when_a_rate_limited_request_retries() {
+        struct RetryAccounts(std::sync::Mutex<Vec<Option<String>>>);
+        impl Accounts for RetryAccounts {
+            fn grant(&self, _: Provider, _: &[String]) -> Result<Grant, String> {
+                unreachable!()
+            }
+            fn grant_model(
+                &self,
+                _: Provider,
+                model: Option<&str>,
+                avoid: &[String],
+            ) -> Result<Grant, String> {
+                self.0.lock().unwrap().push(model.map(str::to_owned));
+                Ok(grant(if avoid.is_empty() { "a" } else { "b" }))
+            }
+            fn stale(&self, _: &Grant) -> Result<Option<Grant>, String> {
+                Ok(None)
+            }
+        }
+        let (up, _) = upstream(vec![(429, "limited"), (200, "ok")]);
+        let accounts = RetryAccounts(std::sync::Mutex::new(vec![]));
+        let mut req = post("/v1/messages", KEY);
+        req.body = br#"{"model":"claude-opus-test"}"#.to_vec();
+        let (status, _) = answered(&req, &up, &accounts);
+        assert_eq!(status, 200);
+        assert_eq!(*accounts.0.lock().unwrap(), vec![Some("claude-opus-test".into()); 2]);
+    }
+
     fn post(path: &str, key: &str) -> Request {
         request(&format!(
             "POST {path} HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {key}\r\n\
@@ -1118,7 +1265,7 @@ mod tests {
         (status, out)
     }
 
-    fn answered(request: &Request, upstream: &Upstream, pool: &Pool) -> (u16, String) {
+    fn answered(request: &Request, upstream: &Upstream, pool: &dyn Accounts) -> (u16, String) {
         let (status, body, _) = answered_fully(request, upstream, pool);
         (status, body)
     }
@@ -1128,7 +1275,7 @@ mod tests {
     fn answered_fully(
         request: &Request,
         upstream: &Upstream,
-        pool: &Pool,
+        pool: &dyn Accounts,
     ) -> (u16, String, Outcome) {
         let upstreams = Upstreams { claude: upstream, codex: upstream };
         let mut out = Vec::new();

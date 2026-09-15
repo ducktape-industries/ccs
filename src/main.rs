@@ -32,6 +32,7 @@ fn run() -> Result<()> {
     let ctx = env.ctx();
 
     match command {
+        Cmd::Claude { args } => ccs::routed::launch(env, &args),
         Cmd::Pick => cmd::pick(&ctx),
         Cmd::List { json, cached } => cmd::list(&ctx, json, cached),
         Cmd::Use { target, force } => cmd::use_account(&ctx, &target, force),

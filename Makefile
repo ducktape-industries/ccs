@@ -8,7 +8,7 @@
 PREFIX ?= $(or $(CARGO_HOME),$(HOME)/.cargo)
 BIN := ccs
 
-# The app: a Rust crate under app/, written in Ice. On macOS it is wrapped
+# The app: a Rust crate under app/, written with GPUI Kit. On macOS it is wrapped
 # into a bundle, because notifications and launch-at-login want one, and
 # ad-hoc signed so it runs on the machine that built it; elsewhere it is the
 # binary and a desktop entry.
@@ -42,8 +42,8 @@ lint: ## clippy over the workspace, with warnings as errors
 
 check: fmt lint test lint-app test-app ## fmt, lint and test — everything before a commit
 
-lint-app: ## check the app's Ice sources (needs cargo-ice)
-	cd app && cargo ice check
+lint-app: ## lint the native app
+	cargo clippy -p ccs-app --all-targets -- -D warnings
 
 test-app: ## run the app's tests
 	cargo test -p ccs-app

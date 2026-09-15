@@ -431,11 +431,71 @@ The app links `ccs` as a library, so there is one process: the watcher runs on
 a thread of its own and is the one thing that polls, the gateway's listener
 and desk run on threads of the same process, and the window reads what the
 watcher last wrote down. Quitting takes the gateway down with it. It is
-written in [Ice](https://github.com/byeongsu-hong/ducktape-ui), a checked UI
-language for iced, taken as a git dependency at a pinned revision since it is
-not on crates.io; `make app` builds it, `make test-app` runs its tests, and
-`make lint-app` runs the Ice checker (`cargo install --git
-https://github.com/byeongsu-hong/ducktape-ui cargo-ice`).
+written with [GPUI Kit](https://github.com/longbridge/gpui-kit), pinned to
+0.6.1. The native dashboard separates account usage, model routes and settings.
+Usage cells adapt to the number of reported limits and the window width, including
+new model-scoped limits. Model availability flags are not shown as usage.
+The window fits four to eight accounts by default, with six combined Claude and
+Codex accounts fitting without scrolling at the minimum width. macOS window
+controls share a single compact row with the tabs; clicking the menu bar item
+brings the window to the active desktop.
+`make app` builds the bundle, `make test-app` runs its tests, and `make lint-app`
+runs Clippy. Iced, the Ice compiler and generated UI sources are no longer used.
+
+### Model routing in Claude Code
+
+In **Model routing**, enter a model ID or a prefix ending in `*`, then select
+its primary account and optional fallback accounts in order. For example:
+
+| Model pattern | Primary account |
+| --- | --- |
+| `claude-opus-*` | account A |
+| `claude-fable-*` | account B |
+
+Launch a routed Claude Code session from your project:
+
+```sh
+ccs claude -- --model fable
+# Existing sessions can be resumed with normal Claude Code flags:
+ccs claude -- --continue
+```
+
+CCS starts a session-owned loopback proxy on an available port and passes its
+endpoint and local credential to Claude Code. No shell profile or global Claude
+Code login is changed. Every request is routed by its actual `model` field:
+a Fable parent uses B while its Opus subagent uses A, including concurrent
+requests. `/model` changes apply on the next request. `ccs pin` remains the
+alternative for a session that must stay on one account.
+
+Rules live in `~/.claude/ccs/routing.json` (under `CLAUDE_CONFIG_DIR` when set).
+Both `ccs claude` and the dashboard/`ccs serve` gateway reload them per request,
+so saving a route does not interrupt an in-flight stream. Exact IDs win over
+prefixes; the longest prefix wins. Unmatched or model-less requests use the
+active account and the gateway's ordinary pool. A matched rule tries **only**
+its own accounts, in order, on HTTP 429; it never falls back into another model's
+account pool. Invalid files or missing/provider-mismatched targets fail closed.
+CCS does not manufacture additional quota; provider-side shared limits still apply.
+
+The proxy preserves request bodies and streaming responses, substitutes the
+selected account's OAuth token, and uses the existing token refresh handling.
+Claude Code's custom-endpoint restrictions also apply, including Remote Control
+availability; see [Claude Code environment variables](https://code.claude.com/docs/en/env-vars).
+
+Verification without real inference:
+
+```sh
+python3 scripts/verify-claude-routing.py
+```
+
+This launches your installed Claude Code against a local SSE stub with a temporary
+configuration and test token, drives a real Opus Agent tool call from a Fable
+parent, and checks that both models inherit the local endpoint and OAuth headers.
+`CCS_LOG_REQUESTS=1 ccs claude` enables request/account diagnostics on stderr.
+
+Core tests separately verify account selection, isolated credentials, retries,
+rule reloads and unchanged request bodies. This local test does not verify live
+subscription entitlement or the upstream acceptance of a particular account.
+
 
 ## How it works
 

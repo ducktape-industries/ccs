@@ -18,13 +18,6 @@ ureq = { version = "3", features = ["json"] }
 [workspace]
 members = ["app"]
 
-# ducktape-ui patches two iced crates in its own workspace, and a dependant
-# does not inherit a patch: without these the app would run the runtime
-# against crates it was never tested with. Same revision as the app pins.
-[patch.crates-io]
-iced_tiny_skia = { git = "https://github.com/byeongsu-hong/ducktape-ui", rev = "39377ff1b6553cbbe34bec21e949c7912013978e" }
-iced_winit = { git = "https://github.com/byeongsu-hong/ducktape-ui", rev = "39377ff1b6553cbbe34bec21e949c7912013978e" }
-
 [profile.release]
 opt-level = "z"
 lto = true

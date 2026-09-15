@@ -1,17 +1,4 @@
-//! The Rust side of the app: what the Ice program calls across its typed
-//! boundary. The stash, the network and the platform live behind it; the
-//! program reads what it is handed.
-//!
-//! Three kinds of thread touch the stash here. The handlers' calls — a
-//! load, a switch, the gateway going up or down — each run on a thread of
-//! their own and hand their answer back, so iced's one executor thread is
-//! never held on a keychain read or a network probe. The watcher is one
-//! thread for the life of the process, polling on its interval and reading
-//! its settings fresh each turn. The gateway's desk answers connection
-//! threads on a thread of its own. `STASH` serialises the whole-stash
-//! operations among the first two; the desk's writes go through the same
-//! file lock that already arbitrates `ccs serve` against `ccs watch` across
-//! processes, which is what keeps it and the watcher from crossing.
+//! Background account, usage, routing and preference services for the GPUI app.
 
 #[cfg(not(test))]
 use std::sync::{Arc, Mutex};
@@ -19,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use ccs::cmd::Cached;
 use ccs::model::Health;
 use ccs::render;
-use iced::futures::Stream;
+use futures::Stream;
 use jiff::Timestamp;
 
 /// One limit as the view draws it.
@@ -53,14 +40,6 @@ pub struct Account {
     /// Why there is no reading, when there is none.
     pub note: String,
     pub limits: Vec<Limit>,
-}
-
-/// One account's place in the rotation pool, for the row that ticks it.
-#[derive(Clone, Debug, PartialEq)]
-pub struct PoolEntry {
-    pub slug: String,
-    pub email: String,
-    pub ticked: bool,
 }
 
 /// What went wrong, for the window to say. A switch refused because the
@@ -172,7 +151,7 @@ fn env() -> Result<Arc<ccs::env::Env>, Failure> {
 async fn offload<T: Send + 'static>(
     work: impl FnOnce() -> Result<T, Failure> + Send + 'static,
 ) -> Result<T, Failure> {
-    let (tx, rx) = iced::futures::channel::oneshot::channel();
+    let (tx, rx) = futures::channel::oneshot::channel();
     std::thread::spawn(move || {
         let _ = tx.send(work());
     });
@@ -262,8 +241,8 @@ pub fn watch(high: f64) -> impl Stream<Item = Result<Poll, Failure>> + Send + 's
     }
     #[cfg(not(test))]
     {
-        use iced::futures::SinkExt;
-        let (mut tx, rx) = iced::futures::channel::mpsc::channel::<Result<Poll, Failure>>(4);
+        use futures::SinkExt;
+        let (mut tx, rx) = futures::channel::mpsc::channel::<Result<Poll, Failure>>(4);
         std::thread::spawn(move || {
             let mut before = ccs::watch::Snapshot::new();
             // What the cache already holds decides how long the first wait is.
@@ -286,7 +265,7 @@ pub fn watch(high: f64) -> impl Stream<Item = Result<Poll, Failure>> + Send + 's
                         crate::platform::notify("ccs", line);
                     }
                 }
-                if iced::futures::executor::block_on(tx.send(turn)).is_err() {
+                if futures::executor::block_on(tx.send(turn)).is_err() {
                     return;
                 }
                 wait = INTERVAL;
@@ -339,45 +318,22 @@ fn youngest(accounts: &[Account]) -> Option<std::time::Duration> {
 
 // ── the menu bar item ───────────────────────────────────────────────────────
 
-/// A click on the menu bar item, each as it lands. The item carries no
-/// menu, so the platform hands the click on, and Ice's tray does not
-/// forward it; this reads it from the same `tray_icon` the runtime built
-/// the item with. Nowhere but macOS has the item, so nowhere else does
-/// this ever yield.
-pub fn tray_clicks() -> iced::futures::stream::BoxStream<'static, ()> {
-    use iced::futures::StreamExt;
-    #[cfg(all(target_os = "macos", not(test)))]
-    {
-        let (tx, rx) = iced::futures::channel::mpsc::unbounded::<()>();
-        tray_icon::TrayIconEvent::set_event_handler(Some(
-            move |event: tray_icon::TrayIconEvent| {
-                if let tray_icon::TrayIconEvent::Click {
-                    button: tray_icon::MouseButton::Left,
-                    button_state: tray_icon::MouseButtonState::Up,
-                    ..
-                } = event
-                {
-                    let _ = tx.unbounded_send(());
-                }
-            },
-        ));
-        rx.boxed()
-    }
-    // A test drains every stream before it judges, so here the clicks end
-    // at once rather than hold the test open.
-    #[cfg(test)]
-    {
-        iced::futures::stream::empty().boxed()
-    }
-    #[cfg(all(not(target_os = "macos"), not(test)))]
-    iced::futures::stream::pending().boxed()
-}
-
-/// The window to bring forward, when one is open; a failure when none is,
-/// which is the route that opens one. An Ice handler has no branch of its
-/// own, so this is where the choice is made.
-pub async fn raise(held: Option<iced::window::Id>) -> Result<iced::window::Id, Failure> {
-    held.ok_or_else(|| Failure::new("no window is open"))
+/// Menu bar clicks forwarded to the GPUI window.
+#[cfg(all(target_os = "macos", not(test)))]
+pub fn tray_clicks() -> futures::stream::BoxStream<'static, ()> {
+    use futures::StreamExt;
+    let (tx, rx) = futures::channel::mpsc::unbounded::<()>();
+    tray_icon::TrayIconEvent::set_event_handler(Some(move |event: tray_icon::TrayIconEvent| {
+        if let tray_icon::TrayIconEvent::Click {
+            button: tray_icon::MouseButton::Left,
+            button_state: tray_icon::MouseButtonState::Up,
+            ..
+        } = event
+        {
+            let _ = tx.unbounded_send(());
+        }
+    }));
+    rx.boxed()
 }
 
 // ── the gateway ─────────────────────────────────────────────────────────────
@@ -457,35 +413,11 @@ pub fn write_prefs(path: &std::path::Path, prefs: &Prefs) -> Result<(), Failure>
 
 /// The preferences as the program starts: each state field asks for its
 /// own at initialization.
-fn prefs() -> Prefs {
+pub fn prefs() -> Prefs {
     #[cfg(test)]
     return Prefs::default();
     #[cfg(not(test))]
     prefs_path().map(|path| read_prefs(&path)).unwrap_or_default()
-}
-
-pub fn pref_gateway_on() -> bool {
-    prefs().gateway_on
-}
-
-pub fn pref_gateway_port() -> String {
-    prefs().gateway_port
-}
-
-pub fn pref_rotation_on() -> bool {
-    prefs().rotation_on
-}
-
-pub fn pref_pool() -> Vec<String> {
-    prefs().pool
-}
-
-pub fn pref_notifications_on() -> bool {
-    prefs().notifications_on
-}
-
-pub fn pref_launch_at_login() -> bool {
-    prefs().launch_at_login
 }
 
 /// Write the preferences down. Every toggle calls this; the answer is
@@ -581,16 +513,6 @@ fn clock_in(rfc3339: &str, now: Timestamp, zone: jiff::tz::TimeZone) -> String {
     }
 }
 
-/// The accounts a first-class test starts from, as a state initializer can
-/// ask for them; empty outside tests, where the real reading comes from
-/// `load`.
-pub fn fixture_accounts() -> Vec<Account> {
-    #[cfg(test)]
-    return fixture::reset();
-    #[cfg(not(test))]
-    Vec::new()
-}
-
 /// The stash a first-class test sees. Externs are real in those tests, so
 /// the real thing is replaced here, under `cfg(test)`, by one that answers
 /// the way the stash would: a switch marks one account of the provider
@@ -664,7 +586,7 @@ pub mod fixture {
             notices: vec!["session-high: hong@example.com has crossed 90%".into()],
             rotated: vec!["switched to agent@example.com".into()],
         };
-        iced::futures::stream::once(async move { Ok(turn) })
+        futures::stream::once(async move { Ok(turn) })
     }
 
     pub fn gateway(on: bool, port: &str) -> String {
@@ -784,6 +706,26 @@ mod tests {
     }
 
     #[test]
+    fn dashboard_limits_exclude_model_availability() {
+        let now: Timestamp = "2026-09-15T00:00:00Z".parse().unwrap();
+        let mut row = cached(
+            "a",
+            false,
+            Ok((0..7)
+                .map(|i| reading(&format!("future-{i}"), i as f64, "2026-09-16T00:00:00Z"))
+                .collect()),
+        );
+        row.entry.usage.as_mut().unwrap().model_usage = Some(
+            serde_json::from_value(serde_json::json!({
+                "future-model": {"available": false}, "unknown-model": {}
+            }))
+            .unwrap(),
+        );
+        let account = &accounts_of(&[row], now)[0];
+        assert_eq!(account.limits.len(), 7);
+    }
+
+    #[test]
     fn an_account_without_a_reading_carries_the_reason_and_no_session() {
         let rows = vec![cached("n", false, Err("not polled yet".into()))];
         let account = &accounts_of(&rows, Timestamp::now())[0];
@@ -806,4 +748,33 @@ mod tests {
         assert_eq!(clock_in("nonsense", now, seoul), "");
         assert!(!clock("2026-09-07T11:30:00Z", now).is_empty());
     }
+}
+
+pub async fn load_routes() -> Result<ccs::routing::Routing, Failure> {
+    #[cfg(test)]
+    return Ok(ccs::routing::Routing::default());
+    #[cfg(not(test))]
+    offload(|| Ok(ccs::routing::Routing::read(env()?.ctx().stash.root())?)).await
+}
+
+pub async fn save_routes(routes: ccs::routing::Routing) -> Result<(), Failure> {
+    #[cfg(test)]
+    return routes.validate().map_err(Failure::from);
+    #[cfg(not(test))]
+    offload(move || {
+        let env = env()?;
+        let accounts = env.ctx().stash.list()?;
+        routes.validate()?;
+        for rule in &routes.rules {
+            for slug in &rule.accounts {
+                if !accounts.iter().any(|a| a.slug == *slug && a.account.provider == rule.provider)
+                {
+                    return Err(Failure::new(format!("No {} account named {slug}", rule.provider)));
+                }
+            }
+        }
+        routes.write(env.ctx().stash.root())?;
+        Ok(())
+    })
+    .await
 }

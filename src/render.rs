@@ -418,7 +418,7 @@ fn model_label(name: &str) -> &str {
     }
 }
 
-fn availability(status: Option<&ModelAvailability>) -> String {
+pub fn availability(status: Option<&ModelAvailability>) -> String {
     availability_at(status, Timestamp::now())
 }
 

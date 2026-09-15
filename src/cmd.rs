@@ -1110,6 +1110,35 @@ fn grant_of(entry: &Stashed) -> Grant {
 }
 
 impl serve::Accounts for Desk<'_> {
+    fn grant_model(
+        &self,
+        provider: Provider,
+        model: Option<&str>,
+        avoid: &[String],
+    ) -> Result<Grant, String> {
+        let routed = || -> Result<Grant> {
+            let routing = crate::routing::Routing::read(self.ctx.stash.root())?;
+            let Some(rule) = model.and_then(|m| routing.matching(provider, m)) else {
+                return self.grant(provider, avoid).map_err(anyhow::Error::msg);
+            };
+            let mut accounts = self.ctx.stash.list()?;
+            // Validate every target before sending; never silently use another provider.
+            for slug in &rule.accounts {
+                if !accounts.iter().any(|a| a.slug == *slug && a.account.provider == provider) {
+                    bail!("route {} refers to missing {} account {}", rule.model, provider, slug);
+                }
+            }
+            let slug = rule
+                .accounts
+                .iter()
+                .find(|s| !avoid.contains(s))
+                .context("all accounts assigned to this model are limited")?;
+            let live = self.live(&accounts)?;
+            self.hand_out(slug, &mut accounts, &live)
+        };
+        routed().map_err(|e| describe(&e))
+    }
+
     fn grant(&self, provider: Provider, avoid: &[String]) -> Result<Grant, String> {
         let granted = || -> Result<Grant> {
             let mut accounts = self.ctx.stash.list()?;
@@ -2310,6 +2339,62 @@ mod tests {
         }
         fixture.pool = pool.iter().map(|s| s.to_string()).collect();
         fixture
+    }
+
+    #[test]
+    fn model_routes_apply_independently_and_never_change_the_active_account() {
+        use crate::routing::{Routing, Rule};
+        let fixture = desk_fixture("desk-model-routes", Some("c"), &["c"]);
+        let routing = Routing {
+            rules: vec![
+                Rule {
+                    provider: Provider::Claude,
+                    model: "claude-opus-*".into(),
+                    accounts: vec!["a".into()],
+                },
+                Rule {
+                    provider: Provider::Claude,
+                    model: "claude-fable-*".into(),
+                    accounts: vec!["b".into(), "a".into()],
+                },
+            ],
+        };
+        routing.write(fixture.stash.root()).unwrap();
+        let ctx = fixture.ctx();
+        let desk = Desk { ctx: &ctx, pool: &fixture.pool };
+        for _ in 0..4 {
+            assert_eq!(
+                desk.grant_model(Provider::Claude, Some("claude-opus-test"), &[]).unwrap().slug,
+                "a"
+            );
+            assert_eq!(
+                desk.grant_model(Provider::Claude, Some("claude-fable-test"), &[]).unwrap().slug,
+                "b"
+            );
+        }
+        assert_eq!(
+            desk.grant_model(Provider::Claude, Some("claude-fable-test"), &["b".into()])
+                .unwrap()
+                .slug,
+            "a"
+        );
+        assert!(
+            desk.grant_model(Provider::Claude, Some("claude-opus-test"), &["a".into()]).is_err()
+        );
+        assert_eq!(desk.grant_model(Provider::Claude, Some("unmatched"), &[]).unwrap().slug, "c");
+        assert_eq!(fixture.stash.active(Provider::Claude).as_deref(), Some("c"));
+        let mut changed = routing;
+        changed.rules[0].accounts = vec!["b".into()];
+        changed.write(fixture.stash.root()).unwrap();
+        assert_eq!(
+            desk.grant_model(Provider::Claude, Some("claude-opus-test"), &[]).unwrap().slug,
+            "b"
+        );
+        changed.rules[0].accounts = vec!["missing".into()];
+        changed.write(fixture.stash.root()).unwrap();
+        assert!(desk.grant_model(Provider::Claude, Some("claude-opus-test"), &[]).is_err());
+        std::fs::write(fixture.stash.root().join(crate::routing::FILE), "invalid").unwrap();
+        assert!(desk.grant_model(Provider::Claude, Some("claude-opus-test"), &[]).is_err());
     }
 
     #[test]

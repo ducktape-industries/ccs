@@ -10,9 +10,6 @@ publish = false
 name = "ccs-app"
 path = "src/main.rs"
 
-# ui-lang is not on crates.io; it is taken from its repository at a fixed
-# revision. The three crates and the build helper are one contract and move
-# together.
 [dependencies]
 ccs = { path = ".." }
 anyhow = "1"
@@ -20,21 +17,16 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 jiff = "0.2"
 notify-rust = "4"
-iced = { version = "=0.14.0", features = ["smol"] }
-ui-lang = { git = "https://github.com/byeongsu-hong/ducktape-ui", rev = "39377ff1b6553cbbe34bec21e949c7912013978e" }
-ui-lang-runtime = { git = "https://github.com/byeongsu-hong/ducktape-ui", rev = "39377ff1b6553cbbe34bec21e949c7912013978e" }
+futures = "0.3"
+gpui-kit = "=0.6.1"
 
-# The crate Ice's tray is built on, for the one thing Ice does not forward:
-# a click on the item itself. Same major as the runtime's, so it is the
-# same crate and the same event channel.
 [target.'cfg(target_os = "macos")'.dependencies]
 tray-icon = { version = "0.24", default-features = false }
-
-[build-dependencies]
-ui-lang-build = { git = "https://github.com/byeongsu-hong/ducktape-ui", rev = "39377ff1b6553cbbe34bec21e949c7912013978e" }
-
-[dev-dependencies]
-ui-lang-runtime = { git = "https://github.com/byeongsu-hong/ducktape-ui", rev = "39377ff1b6553cbbe34bec21e949c7912013978e", features = ["test-runtime"] }
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSWindow"] }
 
 [lints.rust]
 unsafe_code = "forbid"
+
+[dev-dependencies]
+gpui-kit = { version = "=0.6.1", features = ["test-support"] }

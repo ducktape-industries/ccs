@@ -9,6 +9,7 @@ ccs - Claude Code and Codex account switcher
 
 USAGE
     ccs                      pick an account interactively
+    ccs claude [-- <args>]   run Claude Code with per-request model account routing
     ccs ls                   every stashed account and what it has left
     ccs use <account>        switch that provider's login to an account
     ccs pin [<account>]      start a session confined to one account, leaving
@@ -72,6 +73,9 @@ OPTIONS
 
 #[derive(Debug, Clone)]
 pub enum Cmd {
+    Claude {
+        args: Vec<String>,
+    },
     Pick,
     List {
         json: bool,
@@ -139,6 +143,9 @@ pub fn parse<I: Iterator<Item = String>>(args: I) -> Result<Cmd> {
     match head.as_str() {
         "-h" | "--help" | "help" => Ok(Cmd::Help),
         "-V" | "--version" | "version" => Ok(Cmd::Version),
+        "claude" => Ok(Cmd::Claude {
+            args: args[1..].strip_prefix(&["--".to_string()]).unwrap_or(&args[1..]).to_vec(),
+        }),
         "ls" | "list" => {
             Ok(Cmd::List { json: has(&args[1..], "--json"), cached: has(&args[1..], "--cached") })
         }

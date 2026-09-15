@@ -91,6 +91,26 @@ pub fn desktop_entry(exe: &Path) -> String {
     )
 }
 
+/// Bring the dashboard into the user's current Space before activating the app.
+#[cfg(target_os = "macos")]
+#[cfg_attr(test, allow(dead_code))]
+pub fn follow_active_space() {
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::{NSApplication, NSWindowCollectionBehavior};
+
+    let Some(mtm) = MainThreadMarker::new() else { return };
+    let app = NSApplication::sharedApplication(mtm);
+    for window in app.windows() {
+        if window.title().to_string() == "ccs" {
+            let mut behavior = window.collectionBehavior();
+            behavior.remove(NSWindowCollectionBehavior::CanJoinAllSpaces);
+            behavior.insert(NSWindowCollectionBehavior::MoveToActiveSpace);
+            window.setCollectionBehavior(behavior);
+            window.makeKeyAndOrderFront(None);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
