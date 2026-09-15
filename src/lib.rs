@@ -22,5 +22,6 @@ pub mod stash;
 pub mod usage;
 pub mod watch;
 
+pub mod route_picker;
 pub mod routed;
 pub mod routing;

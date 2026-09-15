@@ -12,6 +12,7 @@ use gpui_kit::component::{
     button::*,
     checkbox::Checkbox,
     input::{Input, InputState},
+    menu::{DropdownMenu, PopupMenuItem},
     progress::Progress,
     switch::Switch,
     tooltip::Tooltip,
@@ -38,10 +39,15 @@ struct Dashboard {
     status: String,
     gateway_status: String,
     busy: bool,
+    refreshing: bool,
     routes_ready: bool,
     confirming: Option<String>,
     port: Entity<InputState>,
     model: Entity<InputState>,
+    codex_models: Vec<String>,
+    claude_models: Vec<String>,
+    models_loading: bool,
+    model_error: String,
     provider: Provider,
     selected: Vec<String>,
     editing: Option<usize>,
@@ -56,8 +62,7 @@ impl Dashboard {
         let prefs = backend::prefs();
         let port =
             cx.new(|cx| InputState::new(window, cx).default_value(prefs.gateway_port.clone()));
-        let model =
-            cx.new(|cx| InputState::new(window, cx).placeholder("claude-opus-* or exact model ID"));
+        let model = cx.new(|cx| InputState::new(window, cx).placeholder("Model ID or prefix*"));
         backend::set_watch(
             format::pool_for(prefs.rotation_on, &prefs.pool),
             prefs.notifications_on,
@@ -75,10 +80,15 @@ impl Dashboard {
             status: "Loading…".into(),
             gateway_status: "Off".into(),
             busy: false,
+            refreshing: false,
             routes_ready: false,
             confirming: None,
             port,
             model,
+            codex_models: vec![],
+            claude_models: vec![],
+            models_loading: true,
+            model_error: String::new(),
             provider: Provider::Claude,
             selected: vec![],
             editing: None,
@@ -140,6 +150,17 @@ impl Dashboard {
             });
         })
         .detach();
+        cx.spawn(async |this, cx| {
+            let (claude, codex) = futures::join!(
+                backend::load_models(Provider::Claude),
+                backend::load_models(Provider::Codex),
+            );
+            let _ = this.update(cx, |this, cx| {
+                this.set_models(claude, codex);
+                cx.notify();
+            });
+        })
+        .detach();
         if !std::env::args().any(|a| a == "--preview") {
             let mut watch = Box::pin(backend::watch(90.0));
             cx.spawn(async move |this, cx| {
@@ -176,6 +197,51 @@ impl Dashboard {
         if let Some(tray) = &self.tray {
             tray.set_title(Some(format::bar_label(&self.accounts)));
         }
+    }
+
+    fn refresh(&mut self, cx: &mut Context<Self>) {
+        if self.busy || self.models_loading {
+            return;
+        }
+        self.busy = true;
+        self.refreshing = true;
+        self.models_loading = true;
+        self.error.clear();
+        self.status = "Refreshing…".into();
+        cx.notify();
+        cx.spawn(async |this, cx| {
+            let accounts = backend::refresh().await;
+            let (claude, codex) = futures::join!(
+                backend::load_models(Provider::Claude),
+                backend::load_models(Provider::Codex),
+            );
+            let _ = this.update(cx, |this, cx| {
+                this.busy = false;
+                this.refreshing = false;
+                this.set_models(claude, codex);
+                match accounts {
+                    Ok(accounts) => {
+                        let failed = accounts.iter().filter(|a| !a.note.is_empty()).count();
+                        this.set_accounts(accounts);
+                        this.status = if failed == 0 {
+                            if this.model_error.is_empty() {
+                                "Updated".into()
+                            } else {
+                                "Usage updated · model list could not refresh".into()
+                            }
+                        } else {
+                            format!("Updated · {failed} account(s) could not refresh")
+                        };
+                    }
+                    Err(error) => {
+                        this.error = error.message;
+                        this.status.clear();
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn persist(&mut self) {
@@ -398,6 +464,39 @@ impl Dashboard {
         content
     }
 
+    fn set_models(
+        &mut self,
+        claude: Result<Vec<String>, backend::Failure>,
+        codex: Result<Vec<String>, backend::Failure>,
+    ) {
+        self.models_loading = false;
+        let mut errors = vec![];
+        for (name, result, models) in
+            [("Claude", claude, &mut self.claude_models), ("Codex", codex, &mut self.codex_models)]
+        {
+            match result {
+                Ok(ids) => *models = ids,
+                Err(error) => errors.push(format!("{name}: {}", error.message)),
+            }
+        }
+        self.model_error = errors.join(" · ");
+    }
+
+    fn model_options(&self) -> Vec<String> {
+        let mut options = match self.provider {
+            Provider::Claude => self.claude_models.clone(),
+            Provider::Codex => self.codex_models.clone(),
+        };
+        for model in
+            self.routes.rules.iter().filter(|r| r.provider == self.provider).map(|r| &r.model)
+        {
+            if !options.contains(model) {
+                options.push(model.clone());
+            }
+        }
+        options
+    }
+
     fn routes_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let mut content = div().v_flex().gap_4().child(
             div()
@@ -498,6 +597,8 @@ impl Dashboard {
         if !self.editor_open {
             return content;
         }
+        let options = self.model_options();
+        let model_input = self.model.clone();
         let mut editor = div()
             .v_flex()
             .gap_3()
@@ -511,6 +612,30 @@ impl Dashboard {
                     .items_center()
                     .gap_3()
                     .child(div().w(px(280.)).child(Input::new(&self.model).id("model-input")))
+                    .child(
+                        Button::new("model-options")
+                            .small()
+                            .label(if self.models_loading { "Loading…" } else { "Models ▾" })
+                            .disabled(self.busy || self.models_loading || options.is_empty())
+                            .dropdown_menu(move |mut menu, _, cx| {
+                                for option in &options {
+                                    let model = option.clone();
+                                    let input = model_input.clone();
+                                    menu = menu.item(
+                                        PopupMenuItem::new(option.clone())
+                                            .checked(
+                                                model_input.read(cx).value().as_ref() == option,
+                                            )
+                                            .on_click(move |_, window, cx| {
+                                                input.update(cx, |state, cx| {
+                                                    state.set_value(model.clone(), window, cx)
+                                                });
+                                            }),
+                                    );
+                                }
+                                menu
+                            }),
+                    )
                     .children(Provider::ALL.into_iter().map(|p| {
                         Button::new(SharedString::from(format!("provider-{p}")))
                             .small()
@@ -518,30 +643,42 @@ impl Dashboard {
                             .label(p.to_string())
                             .selected(self.provider == p)
                             .disabled(self.busy)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.provider = p;
-                                this.selected.clear();
-                                cx.notify();
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                if this.provider != p {
+                                    this.provider = p;
+                                    this.selected.clear();
+                                    this.model.update(cx, |s, cx| s.set_value("", window, cx));
+                                    cx.notify();
+                                }
                             }))
                     })),
             )
+            .child(
+                muted("Choose a model or type an ID. Use a trailing * to match a prefix.")
+                    .text_xs(),
+            )
+            .when(!self.model_error.is_empty(), |editor| {
+                editor.child(muted(self.model_error.clone()).text_xs())
+            })
             .child(muted("Select accounts in priority order.").text_xs());
         for a in self.accounts.iter().filter(|a| a.provider == self.provider.to_string()) {
             let slug = a.slug.clone();
             let order = self.selected.iter().position(|s| s == &a.slug);
             editor = editor.child(
-                Checkbox::new(SharedString::from(format!("route-account-{slug}")))
-                    .label(format!(
+                account_checkbox(
+                    format!("route-account-{slug}"),
+                    format!(
                         "{}{}",
                         order.map(|n| format!("{}. ", n + 1)).unwrap_or_default(),
                         a.email
-                    ))
-                    .checked(order.is_some())
-                    .disabled(self.busy)
-                    .on_click(cx.listener(move |this, on, _, cx| {
-                        this.selected = format::toggled(&this.selected, slug.clone(), *on);
-                        cx.notify();
-                    })),
+                    ),
+                )
+                .checked(order.is_some())
+                .disabled(self.busy)
+                .on_click(cx.listener(move |this, on, _, cx| {
+                    this.selected = format::toggled(&this.selected, slug.clone(), *on);
+                    cx.notify();
+                })),
             );
         }
         editor = editor.child(
@@ -638,17 +775,18 @@ impl Dashboard {
                 let slug = a.slug.clone();
                 content = content.child(
                     row().pl_4().child(
-                        Checkbox::new(SharedString::from(format!("pool-{slug}")))
-                            .label(format!("{} · {}", a.provider, a.email))
-                            .checked(self.prefs.pool.contains(&slug))
-                            .disabled(self.busy)
-                            .on_click(cx.listener(move |this, on, _, cx| {
-                                this.prefs.pool =
-                                    format::toggled(&this.prefs.pool, slug.clone(), *on);
-                                this.persist();
-                                this.gateway(cx);
-                                cx.notify();
-                            })),
+                        account_checkbox(
+                            format!("pool-{slug}"),
+                            format!("{} · {}", a.provider, a.email),
+                        )
+                        .checked(self.prefs.pool.contains(&slug))
+                        .disabled(self.busy)
+                        .on_click(cx.listener(move |this, on, _, cx| {
+                            this.prefs.pool = format::toggled(&this.prefs.pool, slug.clone(), *on);
+                            this.persist();
+                            this.gateway(cx);
+                            cx.notify();
+                        })),
                     ),
                 );
             }
@@ -697,6 +835,15 @@ impl Dashboard {
     }
 }
 
+fn account_checkbox(id: String, label: String) -> Checkbox {
+    // The built-in label clips descenders with its 1em line height.
+    Checkbox::new(SharedString::from(id))
+        .small()
+        .items_center()
+        .accessibility_label(label.clone())
+        .child(div().line_height(px(20.)).child(label))
+}
+
 fn muted(text: impl Into<SharedString>) -> Div {
     div().text_sm().text_color(rgb(0x737373)).child(text.into())
 }
@@ -741,6 +888,14 @@ impl Render for Dashboard {
                     .h(px(24.))
                     .on_mouse_down(MouseButton::Left, |_, window, _| window.start_window_move())
                     .on_double_click(|_, window, _| window.titlebar_double_click()),
+            )
+            .child(
+                Button::new("refresh")
+                    .small()
+                    .ghost()
+                    .label(if self.refreshing { "Refreshing…" } else { "Refresh" })
+                    .disabled(self.busy || self.models_loading)
+                    .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
             )
             .child(
                 Button::new("quit").small().ghost().label("Quit").on_click(|_, _, cx| cx.quit()),
@@ -883,6 +1038,115 @@ mod ui_tests {
     use gpui_kit::component::Root;
     use gpui_kit::test::TestWindowExt;
     use gpui_kit::{AppContext, TestAppContext};
+
+    #[gpui_kit::test]
+    fn refresh_updates_accounts_without_discarding_route_edits(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let mut dashboard = None;
+        let handle = cx.add_window(|window, cx| {
+            let view = cx.new(|cx| Dashboard::new(window, cx));
+            dashboard = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        cx.run_until_parked();
+        let dashboard = dashboard.unwrap();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.click("routes", cx);
+            window.click("new-route", cx);
+            window.click("model-input", cx);
+            window.input("custom-model-v2", cx);
+            window.click("route-account-agent", cx);
+        })
+        .unwrap();
+        dashboard.update(cx, |view, cx| {
+            view.accounts.clear();
+            cx.notify();
+        });
+        cx.update_window(handle.into(), |_, window, cx| window.click("refresh", cx)).unwrap();
+        cx.run_until_parked();
+        dashboard.update(cx, |view, cx| {
+            assert!(!view.accounts.is_empty());
+            assert_eq!(view.model.read(cx).value(), "custom-model-v2");
+            assert_eq!(view.selected, ["agent"]);
+            assert!(view.editor_open);
+            assert!(!view.busy);
+            assert!(!view.refreshing);
+            assert_eq!(view.status, "Updated");
+        });
+    }
+
+    #[gpui_kit::test]
+    fn model_dropdown_selects_and_saves_with_provider_specific_options(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let mut dashboard = None;
+        let handle = cx.add_window(|window, cx| {
+            let view = cx.new(|cx| Dashboard::new(window, cx));
+            dashboard = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        cx.run_until_parked();
+        let dashboard = dashboard.unwrap();
+        dashboard.update(cx, |view, _| {
+            view.codex_models = vec!["gpt-example".into()];
+            view.claude_models = vec!["claude-new-model-v9".into()];
+        });
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.click("routes", cx);
+            window.click("new-route", cx);
+            window.click("model-options", cx);
+            window.press("down", cx);
+            window.press("enter", cx);
+        })
+        .unwrap();
+        dashboard.update(cx, |view, cx| {
+            assert_eq!(view.model.read(cx).value(), "claude-new-model-v9");
+            assert!(!view.model_options().contains(&"gpt-example".into()));
+        });
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.click("route-account-agent", cx);
+            window.click("provider-codex", cx);
+        })
+        .unwrap();
+        dashboard.update(cx, |view, cx| {
+            assert!(view.model.read(cx).value().is_empty());
+            assert!(view.selected.is_empty());
+            assert_eq!(view.model_options(), ["gpt-example"]);
+        });
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.click("model-options", cx);
+            window.press("down", cx);
+            window.press("enter", cx);
+        })
+        .unwrap();
+        dashboard.update(cx, |view, cx| assert_eq!(view.model.read(cx).value(), "gpt-example"));
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.click("provider-claude", cx);
+            window.click("model-options", cx);
+            window.press("down", cx);
+            window.press("enter", cx);
+            window.click("route-account-agent", cx);
+            window.click("save-route", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        dashboard.update(cx, |view, _| {
+            assert_eq!(view.routes.rules[0].model, "claude-new-model-v9");
+            assert_eq!(view.routes.rules[0].accounts, ["agent"]);
+            view.set_models(
+                Err(super::backend::Failure {
+                    message: "offline".into(),
+                    slug: String::new(),
+                    spent: false,
+                }),
+                Ok(vec!["codex-next-model".into()]),
+            );
+            assert_eq!(view.model_options(), ["claude-new-model-v9"]);
+            assert_eq!(view.codex_models, ["codex-next-model"]);
+            assert!(view.model_error.contains("offline"));
+            view.set_models(Ok(vec![]), Ok(vec![]));
+            assert_eq!(view.model_options(), ["claude-new-model-v9"], "saved IDs remain editable");
+        });
+    }
 
     #[gpui_kit::test]
     fn six_accounts_fit_without_scroll_at_minimum_width(cx: &mut TestAppContext) {

@@ -149,6 +149,14 @@ impl Style {
     pub fn bold(&self, text: &str) -> String {
         self.paint(text, BOLD)
     }
+
+    pub fn accent(&self, text: &str) -> String {
+        self.paint(text, "\x1b[36m")
+    }
+
+    pub fn selected(&self, text: &str) -> String {
+        self.paint(text, "\x1b[1;7m")
+    }
 }
 
 /// Each provider owns its columns. Codex has multiple quota pools per account,

@@ -85,6 +85,43 @@ impl Api {
         self.get_json(&format!("{API_BASE}/api/oauth/usage"), token)
     }
 
+    /// Exact wire IDs from the provider catalog, following its pagination.
+    pub fn models(&self, token: &str) -> Result<Vec<String>> {
+        let mut ids = Vec::new();
+        let mut after = String::new();
+        loop {
+            let mut request = self
+                .agent
+                .get(format!("{API_BASE}/v1/models"))
+                .header("Authorization", &format!("Bearer {token}"))
+                .header("anthropic-version", "2023-06-01")
+                .header("anthropic-beta", BETA)
+                .query("limit", "1000");
+            if !after.is_empty() {
+                request = request.query("after_id", &after);
+            }
+            let mut response = request.call().context("loading Claude models")?;
+            if response.status().as_u16() != 200 {
+                bail!("Claude models returned {}", response.status().as_u16());
+            }
+            let page: ModelPage =
+                response.body_mut().read_json().context("parsing Claude models")?;
+            for model in page.data {
+                if !model.id.is_empty() && !ids.contains(&model.id) {
+                    ids.push(model.id);
+                }
+            }
+            if !page.has_more {
+                return Ok(ids);
+            }
+            let next = page.last_id.context("Claude models omitted the next page cursor")?;
+            if next.is_empty() || next == after {
+                bail!("Claude models returned a repeated page cursor");
+            }
+            after = next;
+        }
+    }
+
     /// Trade a refresh token for a fresh access token.
     ///
     /// The response may rotate the refresh token, and the caller must persist
@@ -139,6 +176,18 @@ impl Api {
         }
         resp.body_mut().read_json().with_context(|| format!("parsing response from {url}"))
     }
+}
+
+#[derive(Deserialize)]
+struct ModelPage {
+    data: Vec<ModelId>,
+    has_more: bool,
+    last_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ModelId {
+    id: String,
 }
 
 /// Fold refreshed tokens into a credential blob, preserving every field the

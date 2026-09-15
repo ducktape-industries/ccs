@@ -462,6 +462,73 @@ pub struct Cached {
     pub polled_at: Option<String>,
 }
 
+/// Poll usage using the normal provider APIs, without rotating accounts or sending notices.
+pub fn refresh_readings(ctx: &Ctx) -> Result<Vec<Cached>> {
+    let mut accounts = stashed(ctx)?;
+    let (table, _) = survey(ctx, &mut accounts, Style::detect())?;
+    table
+        .entries()
+        .iter()
+        .map(|entry| {
+            let polled_at = if entry.usage.is_ok() {
+                ctx.usage.read(&entry.slug)?.map(|reading| reading.polled_at)
+            } else {
+                None
+            };
+            Ok(Cached { entry: entry.clone(), polled_at })
+        })
+        .collect()
+}
+
+/// Provider-native catalog shared by the GUI and terminal route editors.
+pub fn model_ids(ctx: &Ctx, provider: Provider) -> Result<Vec<String>> {
+    let active = ctx.stash.active(provider);
+    let account = ctx
+        .stash
+        .list()?
+        .into_iter()
+        .filter(|a| a.account.provider == provider)
+        .max_by_key(|a| active.as_deref() == Some(a.slug.as_str()));
+    let Some(account) = account else {
+        return Ok(vec![]);
+    };
+    let oauth = &account.account.oauth;
+    match provider {
+        Provider::Claude => ctx.api.models(&oauth.access_token),
+        Provider::Codex => {
+            let cache = std::fs::read(ctx.codex.dir().join("models_cache.json"))
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+            let version = cache
+                .as_ref()
+                .and_then(|c| c["client_version"].as_str())
+                .filter(|v| !v.trim().is_empty())
+                .context("Open Codex once to initialize its model catalog, then Refresh")?;
+            let account_id = oauth.account_id().context("Codex account ID is missing")?;
+            ctx.codex_api.models(&oauth.access_token, account_id, version)
+        }
+    }
+}
+
+/// Upsert one model route, preserving every other route and both active logins.
+pub fn save_route(ctx: &Ctx, rule: crate::routing::Rule) -> Result<()> {
+    let accounts = ctx.stash.list()?;
+    for slug in &rule.accounts {
+        if !accounts.iter().any(|a| a.slug == *slug && a.account.provider == rule.provider) {
+            bail!("No {} account named {slug}", rule.provider);
+        }
+    }
+    let mut routes = crate::routing::Routing::read(ctx.stash.root())?;
+    if let Some(existing) =
+        routes.rules.iter_mut().find(|r| r.provider == rule.provider && r.model == rule.model)
+    {
+        *existing = rule;
+    } else {
+        routes.rules.push(rule);
+    }
+    routes.write(ctx.stash.root())
+}
+
 /// Every account with what the last poll wrote down for it: no network, no
 /// refresh, nothing spent. The source of truth for anything that asks more
 /// often than a poll can be afforded, with `ccs watch` keeping it current.
@@ -1256,6 +1323,10 @@ struct Deck<'a, 'b> {
 }
 
 impl picker::Accounts for Deck<'_, '_> {
+    fn edit_route(&mut self, provider: Option<Provider>) -> Result<Option<String>> {
+        crate::route_picker::edit(self.ctx, provider)
+    }
+
     fn poll(&mut self) -> Result<Table> {
         survey(self.ctx, self.accounts, Style::colored()).map(|(table, _)| table)
     }
@@ -2395,6 +2466,51 @@ mod tests {
         assert!(desk.grant_model(Provider::Claude, Some("claude-opus-test"), &[]).is_err());
         std::fs::write(fixture.stash.root().join(crate::routing::FILE), "invalid").unwrap();
         assert!(desk.grant_model(Provider::Claude, Some("claude-opus-test"), &[]).is_err());
+    }
+
+    #[test]
+    fn saving_one_route_preserves_other_provider_routes_and_active_logins() {
+        use crate::routing::{Routing, Rule};
+        let fixture = Fixture::new("save-route");
+        for slug in ["a", "b"] {
+            fixture.stash.save(slug, &stashed(slug, oauth(slug, LATER)).account).unwrap();
+        }
+        fixture
+            .stash
+            .save("g", &codex_stashed("g", codex_oauth("g", LATER, "g@x")).account)
+            .unwrap();
+        fixture.stash.set_active(Provider::Claude, "a").unwrap();
+        fixture.stash.set_active(Provider::Codex, "g").unwrap();
+        let ctx = fixture.ctx();
+        let mut claude = Rule {
+            provider: Provider::Claude,
+            model: "future-model-v9".into(),
+            accounts: vec!["b".into(), "a".into()],
+        };
+        save_route(&ctx, claude.clone()).unwrap();
+        let codex = Rule {
+            provider: Provider::Codex,
+            model: claude.model.clone(),
+            accounts: vec!["g".into()],
+        };
+        save_route(&ctx, codex.clone()).unwrap();
+        claude.accounts.reverse();
+        save_route(&ctx, claude.clone()).unwrap();
+        assert_eq!(Routing::read(ctx.stash.root()).unwrap().rules, [claude, codex]);
+        assert_eq!(ctx.stash.active(Provider::Claude).as_deref(), Some("a"));
+        assert_eq!(ctx.stash.active(Provider::Codex).as_deref(), Some("g"));
+        assert!(fixture.creds.read().unwrap().is_none());
+        assert!(fixture.codex.read().unwrap().is_none());
+
+        let before = fs::read(ctx.stash.root().join(crate::routing::FILE)).unwrap();
+        for rule in [
+            Rule { provider: Provider::Claude, model: "other".into(), accounts: vec!["g".into()] },
+            Rule { provider: Provider::Claude, model: "other".into(), accounts: vec![] },
+            Rule { provider: Provider::Claude, model: "*".into(), accounts: vec!["a".into()] },
+        ] {
+            assert!(save_route(&ctx, rule).is_err());
+            assert_eq!(fs::read(ctx.stash.root().join(crate::routing::FILE)).unwrap(), before);
+        }
     }
 
     #[test]

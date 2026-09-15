@@ -457,6 +457,68 @@ impl Client {
         }
         resp.body_mut().read_json().context("parsing usage")
     }
+
+    /// The same account-scoped catalog queried by Codex clients.
+    pub fn models(
+        &self,
+        token: &str,
+        account_id: &str,
+        client_version: &str,
+    ) -> Result<Vec<String>> {
+        let mut response = self
+            .agent
+            .get("https://chatgpt.com/backend-api/codex/models")
+            .query("client_version", client_version)
+            .header("Authorization", &format!("Bearer {token}"))
+            .header("chatgpt-account-id", account_id)
+            .call()
+            .context("loading Codex models")?;
+        if response.status().as_u16() != 200 {
+            bail!("Codex models returned {}", response.status().as_u16());
+        }
+        let catalog: Models = response.body_mut().read_json().context("parsing Codex models")?;
+        Ok(catalog.visible_ids())
+    }
+}
+
+#[derive(Deserialize)]
+struct Models {
+    models: Vec<ModelOption>,
+}
+
+#[derive(Deserialize)]
+struct ModelOption {
+    slug: String,
+    visibility: String,
+}
+
+impl Models {
+    fn visible_ids(self) -> Vec<String> {
+        let mut ids = vec![];
+        for model in self.models {
+            if model.visibility == "list"
+                && !model.slug.trim().is_empty()
+                && !ids.contains(&model.slug)
+            {
+                ids.push(model.slug);
+            }
+        }
+        ids
+    }
+}
+
+#[test]
+fn catalog_preserves_wire_ids_and_filters_hidden_models() {
+    let catalog: Models = serde_json::from_str(
+        r#"{"models":[
+        {"slug":"new-model-v9","visibility":"list"},
+        {"slug":"internal-model","visibility":"hide"},
+        {"slug":"new-model-v9","visibility":"list"}
+    ]}"#,
+    )
+    .unwrap();
+    assert_eq!(catalog.visible_ids(), ["new-model-v9"]);
+    assert!(serde_json::from_str::<Models>("{}").is_err());
 }
 
 /// Fold a refresh into the credentials: the new pair, the identity token

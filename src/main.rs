@@ -34,6 +34,12 @@ fn run() -> Result<()> {
     match command {
         Cmd::Claude { args } => ccs::routed::launch(env, &args),
         Cmd::Pick => cmd::pick(&ctx),
+        Cmd::Routes { provider } => {
+            if !picker::interactive() {
+                bail!("ccs routes requires an interactive terminal");
+            }
+            ccs::route_picker::run(&ctx, provider)
+        }
         Cmd::List { json, cached } => cmd::list(&ctx, json, cached),
         Cmd::Use { target, force } => cmd::use_account(&ctx, &target, force),
         Cmd::Add { name, current, email, console, sso, provider } => {

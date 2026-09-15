@@ -169,6 +169,19 @@ pub async fn load() -> Result<Vec<Account>, Failure> {
     offload(read_accounts).await
 }
 
+pub async fn refresh() -> Result<Vec<Account>, Failure> {
+    #[cfg(test)]
+    return fixture::load();
+    #[cfg(not(test))]
+    offload(|| {
+        let env = env()?;
+        let _stash = STASH.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let readings = ccs::cmd::refresh_readings(&env.ctx())?;
+        Ok(accounts_of(&readings, Timestamp::now()))
+    })
+    .await
+}
+
 #[cfg(not(test))]
 fn read_accounts() -> Result<Vec<Account>, Failure> {
     let env = env()?;
@@ -228,8 +241,8 @@ pub fn set_watch(pool: Vec<String>, notify: bool) -> bool {
 const INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// The watcher: one poll every five minutes, on a thread of its own for the
-/// life of the process, each turn handed to the window as it happens. The
-/// one thing in the process that asks the API. A first turn is not spent
+/// life of the process, each turn handed to the window as it happens.
+/// Manual refreshes share its stash lock. A first turn is not spent
 /// when the cache is younger than the interval: the window shows that
 /// reading and the thread waits out the rest. Notices are shown as
 /// notifications here, when asked, since a handler cannot walk a list.
@@ -748,6 +761,21 @@ mod tests {
         assert_eq!(clock_in("nonsense", now, seoul), "");
         assert!(!clock("2026-09-07T11:30:00Z", now).is_empty());
     }
+}
+
+/// Load provider-native IDs without translating aliases or changing the active account.
+pub async fn load_models(provider: ccs::model::Provider) -> Result<Vec<String>, Failure> {
+    #[cfg(test)]
+    {
+        let _ = provider;
+        Ok(vec![])
+    }
+    #[cfg(not(test))]
+    offload(move || {
+        let env = env()?;
+        Ok(ccs::cmd::model_ids(&env.ctx(), provider)?)
+    })
+    .await
 }
 
 pub async fn load_routes() -> Result<ccs::routing::Routing, Failure> {

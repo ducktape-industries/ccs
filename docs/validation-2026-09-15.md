@@ -48,6 +48,22 @@ Core tests also cover exact/longest-prefix precedence, provider separation,
 per-model fallback exhaustion, invalid/missing targets, hot reloads, unchanged
 request bytes, simultaneous model requests and preservation of the active login.
 
+## Terminal model routes
+
+- `ccs routes [--claude|--codex]` and `m` in the switch picker use the same
+  dynamic model catalog loader as the GUI. No model IDs are built into the menu.
+- Verified the installed CLI in a real PTY: both provider catalogs, model
+  selection, provider-specific accounts, and returning from `m` to the picker.
+- `scripts/verify-tui-routes.py` uses temporary fake accounts with no client
+  catalog, so its offline/manual flow never makes a network request. It verifies
+  ordered primary/fallback saving, reopening saved IDs, cancellation, terminal
+  restoration, and preservation of other routes and active-account state.
+- Core tests: 279 passed, 1 ignored. App tests: 21 passed. Workspace Clippy,
+  formatting and diff checks passed. Installed through `cargo install --path .
+  --force --locked`. The live gateway kept running; production routes were unchanged.
+- Model fetches use the existing bounded synchronous provider API clients; the
+  terminal displays loading while a request is in flight.
+
 ## Commands
 
 ```sh
@@ -56,6 +72,7 @@ TMPDIR=/private/tmp cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo build --release --workspace
 python3 scripts/verify-claude-routing.py
+python3 scripts/verify-tui-routes.py
 ```
 
 `TMPDIR=/private/tmp` avoids existing macOS tests comparing `/var` paths with

@@ -10,6 +10,7 @@ ccs - Claude Code and Codex account switcher
 USAGE
     ccs                      pick an account interactively
     ccs claude [-- <args>]   run Claude Code with per-request model account routing
+    ccs routes               choose a model and its primary/fallback accounts
     ccs ls                   every stashed account and what it has left
     ccs use <account>        switch that provider's login to an account
     ccs pin [<account>]      start a session confined to one account, leaving
@@ -60,7 +61,7 @@ OPTIONS
         --email <address>    pre-fill the login page (add)
         --console            log in with Console billing, not a subscription (add)
         --sso                force the SSO login flow (add)
-        --codex              choose Codex without a menu (add, status, notify, serve --key)
+        --codex              choose Codex without a menu (add, status, notify, routes, serve --key)
         --claude             choose Claude without a menu (same commands)
         --every <seconds>    poll interval (watch; default 300)
         --high <percent>     session percentage that counts as high (watch; default 90)
@@ -77,6 +78,9 @@ pub enum Cmd {
         args: Vec<String>,
     },
     Pick,
+    Routes {
+        provider: Option<Provider>,
+    },
     List {
         json: bool,
         cached: bool,
@@ -146,6 +150,12 @@ pub fn parse<I: Iterator<Item = String>>(args: I) -> Result<Cmd> {
         "claude" => Ok(Cmd::Claude {
             args: args[1..].strip_prefix(&["--".to_string()]).unwrap_or(&args[1..]).to_vec(),
         }),
+        "routes" => {
+            if args[1..].iter().any(|a| a != "--claude" && a != "--codex") {
+                bail!("usage: ccs routes [--claude | --codex]");
+            }
+            Ok(Cmd::Routes { provider: selected_provider(&args[1..])? })
+        }
         "ls" | "list" => {
             Ok(Cmd::List { json: has(&args[1..], "--json"), cached: has(&args[1..], "--cached") })
         }
@@ -339,6 +349,22 @@ mod tests {
     #[test]
     fn no_arguments_opens_the_picker() {
         assert!(matches!(parsed(&[]), Cmd::Pick));
+    }
+
+    #[test]
+    fn routes_selects_a_provider_and_rejects_ambiguous_or_unknown_flags() {
+        assert!(matches!(parsed(&["routes"]), Cmd::Routes { provider: None }));
+        assert!(matches!(
+            parsed(&["routes", "--codex"]),
+            Cmd::Routes { provider: Some(Provider::Codex) }
+        ));
+        assert!(matches!(
+            parsed(&["routes", "--claude"]),
+            Cmd::Routes { provider: Some(Provider::Claude) }
+        ));
+        for args in [vec!["routes", "--codex", "--claude"], vec!["routes", "--json"]] {
+            assert!(parse(args.into_iter().map(String::from)).is_err());
+        }
     }
 
     #[test]

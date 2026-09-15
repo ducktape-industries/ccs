@@ -69,6 +69,23 @@ Code's are two slots, each with its own account in use.
 **Pinning.** One session on one account, every other session left where it is.
 This is the feature that changes how you work — see below.
 
+## Model routes in the terminal
+
+Press `m` in the account picker to configure a model route for the highlighted
+account's provider, or run `ccs routes` (`--claude` / `--codex` skips the provider
+menu). Models are loaded from the same provider APIs as the desktop app.
+
+- Use arrows and Enter to choose a model, `/` to filter, or `r` to reload.
+- Press `i` to enter an exact model ID or a prefix ending in `*`.
+- Select accounts with Space in priority order: first is primary, then fallbacks.
+  Left/Right moves a selected account earlier/later. Enter saves; Esc goes back.
+
+Saved models stay available when a catalog request fails or a model disappears.
+Saving updates only that provider/model route in `routing.json`, shared with the
+desktop app and gateway. It does not switch either provider's active login.
+Codex model discovery uses the client version in its local `models_cache.json`;
+open Codex once if that file has not been created yet.
+
 ## Install
 
 You need a Rust toolchain. Then:

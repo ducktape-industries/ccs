@@ -37,6 +37,10 @@ pub trait Accounts {
 
     /// Act on the account named by `slug`, whatever acting means to the caller.
     fn act(&mut self, slug: &str) -> Result<Act>;
+
+    fn edit_route(&mut self, _provider: Option<Provider>) -> Result<Option<String>> {
+        Ok(None)
+    }
 }
 
 /// What acting on an account leaves the picker doing.
@@ -61,10 +65,10 @@ enum Mode {
 }
 
 /// Restores the terminal however the picker exits, panic included.
-struct Screen;
+pub(crate) struct Screen;
 
 impl Screen {
-    fn enter() -> Result<Self> {
+    pub(crate) fn enter() -> Result<Self> {
         terminal::enable_raw_mode().context("entering raw mode")?;
         let screen = Self;
         execute!(io::stdout(), terminal::EnterAlternateScreen, cursor::Hide)
@@ -95,6 +99,13 @@ pub fn select<T: Copy>(title: &str, choices: &[(&str, T)]) -> Result<Option<T>> 
         return Ok(None);
     }
     let _screen = Screen::enter()?;
+    select_in_screen(title, choices)
+}
+
+pub(crate) fn select_in_screen<T: Copy>(title: &str, choices: &[(&str, T)]) -> Result<Option<T>> {
+    if choices.is_empty() {
+        return Ok(None);
+    }
     let style = Style::colored();
     let mut at = 0;
     loop {
@@ -114,7 +125,7 @@ pub fn select<T: Copy>(title: &str, choices: &[(&str, T)]) -> Result<Option<T>> 
             Step::Move(next) => at = next,
             Step::Confirm(index) => return Ok(Some(choices[index].1)),
             Step::Unselect | Step::Quit => return Ok(None),
-            Step::Refresh | Step::Ignore => {}
+            Step::Refresh | Step::Routes | Step::Ignore => {}
         }
     }
 }
@@ -214,6 +225,18 @@ pub fn run(accounts: &mut dyn Accounts, verb: Verb) -> Result<Outcome> {
                 }
                 Step::Confirm(target) => mode = Mode::Confirming(target),
                 Step::Refresh => poll_now = true,
+                Step::Routes => {
+                    if matches!(verb, Verb::Switch) {
+                        let provider = at.and_then(|i| table.entries().get(i)).map(|e| e.provider);
+                        mode = match accounts.edit_route(provider) {
+                            Ok(Some(message)) => Mode::Note(message),
+                            Ok(None) => Mode::Browsing,
+                            Err(error) => Mode::Note(format!("route failed: {error}")),
+                        };
+                        painted.clear();
+                        last_key = Instant::now();
+                    }
+                }
                 Step::Quit => return Ok(Outcome::Quit),
                 Step::Ignore => mode = Mode::Browsing,
             }
@@ -268,6 +291,7 @@ enum Step {
     Unselect,
     Confirm(usize),
     Refresh,
+    Routes,
     Quit,
     Ignore,
 }
@@ -301,6 +325,7 @@ fn decide(key: KeyEvent, at: Option<usize>, len: usize) -> Step {
             None => Step::Ignore,
         },
         KeyCode::Char('r') => Step::Refresh,
+        KeyCode::Char('m') => Step::Routes,
         // Moving is what brings the selection back, so putting it away never
         // strands the list. From nowhere, down lands on the first row and up
         // on the last, the way a menu opens from either end.
@@ -349,7 +374,7 @@ fn frame(
 
 /// Clears line by line rather than clearing the screen up front, so a repaint
 /// never shows an empty frame on the way through.
-fn paint(frame: &str) -> Result<()> {
+pub(crate) fn paint(frame: &str) -> Result<()> {
     let mut out = io::stdout().lock();
     queue!(out, cursor::MoveTo(0, 0))?;
     for line in frame.split('\n') {
@@ -374,12 +399,15 @@ fn footer(
         Mode::Browsing => {
             // Only offer the keys that do something: with nothing selected
             // there is no account to act on and nothing to put away.
-            let keys = match at {
+            let mut keys = match at {
                 Some(_) => {
                     format!("enter {}   esc unselect   r refresh   q quit", verb.word())
                 }
                 None => "r refresh   q quit".to_string(),
             };
+            if matches!(verb, Verb::Switch) {
+                keys.push_str("   m model routes");
+            }
             style.dim(&format!("  up/down select   {keys}      updated {}", age(polled.elapsed())))
         }
         Mode::Note(text) => style.bold(&format!("  {text}")),
