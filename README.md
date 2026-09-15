@@ -224,9 +224,9 @@ For example, the Claude section:
 ```
   Claude Code
      ACCOUNT              PLAN    SESSION           WEEKLY            FABLE
->  1 you@example.com      max20x  █░░░  10% 3h54m   ███░  55% 6h24m   ████ 100% 6h24m   <- active
-   2 you+alt@example.com  max5x   ░░░░   0%         █░░░  18% 2d11h   █░░░  22% 2d11h
-   3 team@example.org     pro     ███░  61% 1h44m   ████  88% 5d19h   ███░  70% 5d19h
+>  1 you@example.com      max20x  ▍░░░  10% 3h54m   ██▏░  55% 6h24m   ████ 100% 6h24m   <- active
+   2 you+alt@example.com  max5x   ░░░░   0%         ▋░░░  18% 2d11h   ▉░░░  22% 2d11h
+   3 team@example.org     pro     ██▍░  61% 1h44m   ███▌  88% 5d19h   ██▊░  70% 5d19h
 
   up/down select   enter switch   esc unselect   r refresh   q quit      updated just now
 ```
@@ -236,8 +236,8 @@ The Codex section shows its quota windows and model availability:
 ```text
   Codex
      ACCOUNT              PLAN       5H                WEEKLY            ASTRA
-   4 you@example.com      codex pro  —                 ██░░  29% 2d11h   available         <- active
-   5 you+alt@example.com  codex pro  —                 ███░  65% 2d11h   back 1h30m
+   4 you@example.com      codex pro  —                 █▏░░  29% 2d11h   available         <- active
+   5 you+alt@example.com  codex pro  —                 ██▌░  65% 2d11h   back 1h30m
 ```
 
 Additional pool names and model IDs come from the API. Pool rows belong to the
@@ -259,9 +259,9 @@ to the row you picked and the footer says what happened:
 ```
   Claude Code
      ACCOUNT              PLAN    SESSION           WEEKLY            FABLE
-   1 you@example.com      max20x  █░░░  10% 3h54m   ███░  55% 6h24m   ████ 100% 6h24m
->  2 you+alt@example.com  max5x   ░░░░   0%         █░░░  18% 2d11h   █░░░  22% 2d11h   <- active
-   3 team@example.org     pro     ███░  61% 1h44m   ████  88% 5d19h   ███░  70% 5d19h
+   1 you@example.com      max20x  ▍░░░  10% 3h54m   ██▏░  55% 6h24m   ████ 100% 6h24m
+>  2 you+alt@example.com  max5x   ░░░░   0%         ▋░░░  18% 2d11h   ▉░░░  22% 2d11h   <- active
+   3 team@example.org     pro     ██▍░  61% 1h44m   ███▌  88% 5d19h   ██▊░  70% 5d19h
 
   switched to you+alt@example.com
 ```
@@ -278,9 +278,9 @@ nothing to act on:
 ```
   Claude Code
      ACCOUNT              PLAN    SESSION           WEEKLY            FABLE
-   1 you@example.com      max20x  █░░░  10% 3h54m   ███░  55% 6h24m   ████ 100% 6h24m   <- active
-   2 you+alt@example.com  max5x   ░░░░   0%         █░░░  18% 2d11h   █░░░  22% 2d11h
-   3 team@example.org     pro     ███░  61% 1h44m   ████  88% 5d19h   ███░  70% 5d19h
+   1 you@example.com      max20x  ▍░░░  10% 3h54m   ██▏░  55% 6h24m   ████ 100% 6h24m   <- active
+   2 you+alt@example.com  max5x   ░░░░   0%         ▋░░░  18% 2d11h   ▉░░░  22% 2d11h
+   3 team@example.org     pro     ██▍░  61% 1h44m   ███▌  88% 5d19h   ██▊░  70% 5d19h
 
   up/down select   r refresh   q quit      updated just now
 ```

@@ -13,9 +13,9 @@
 </text>
 <text xml:space="preserve" fill="#c9d1d9">
 <tspan x="22.0" y="108">&gt;  1 z@claude.test  max20x  </tspan>
-<tspan x="257.2" y="108" fill="#3fb950">█░░░  10% 3h54m</tspan>
+<tspan x="257.2" y="108" fill="#3fb950">▍░░░  10% 3h54m</tspan>
 <tspan x="383.2" y="108">   </tspan>
-<tspan x="408.4" y="108" fill="#3fb950">███░  55% 3h54m</tspan>
+<tspan x="408.4" y="108" fill="#3fb950">██▏░  55% 3h54m</tspan>
 <tspan x="534.4" y="108">   </tspan>
 <tspan x="559.6" y="108" fill="#f85149">████ 100% 3h54m</tspan>
 <tspan x="685.6" y="108"> </tspan>
@@ -28,14 +28,14 @@
 </text>
 <text xml:space="preserve" fill="#c9d1d9">
 <tspan x="22.0" y="188">   2 a@codex.test  codex pro  —                 </tspan>
-<tspan x="425.2" y="188" fill="#3fb950">██░░  29% 2d6h</tspan>
+<tspan x="425.2" y="188" fill="#3fb950">█▏░░  29% 2d6h</tspan>
 <tspan x="542.8" y="188">    </tspan>
 <tspan x="576.4" y="188" fill="#3fb950">available</tspan>
 <tspan x="652.0" y="188">         &lt;- active</tspan>
 </text>
 <text xml:space="preserve" fill="#c9d1d9">
 <tspan x="22.0" y="208">   3 b@codex.test  codex pro  —                 </tspan>
-<tspan x="425.2" y="208" fill="#3fb950">███░  65% 2d6h</tspan>
+<tspan x="425.2" y="208" fill="#3fb950">██▌░  65% 2d6h</tspan>
 <tspan x="542.8" y="208">    </tspan>
 <tspan x="576.4" y="208" fill="#f85149">back 1h31m</tspan>
 </text>

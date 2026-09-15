@@ -14,6 +14,11 @@ use crate::model::{Health, Limit, ModelAvailability, Provider, UsageResponse};
 /// Width of a usage bar, in cells.
 const BAR: usize = 4;
 
+/// The partial fills a bar cell can show, indexed by eighths: nothing, then
+/// the left-eighths block glyphs from one eighth to seven. Eight eighths is a
+/// full cell, `█`, so it has no entry here.
+const EIGHTHS: [&str; 8] = ["", "▏", "▎", "▍", "▌", "▋", "▊", "▉"];
+
 /// Rendered width of a reset countdown. The longest a limit can be away is a
 /// week, so `23h59m` is the widest this gets.
 const COUNTDOWN: usize = 6;
@@ -476,16 +481,20 @@ fn rank(column: &str) -> u8 {
     }
 }
 
-/// A usage bar. Any non-zero usage fills at least one cell, so a barely-touched
-/// limit still reads as touched.
+/// A usage bar, filled to the eighth of a cell: a cell is full, one of the
+/// seven left-eighths glyphs, or track. The fill is rounded down so the bar
+/// never claims more than is spent and reads full only at 100%, except that
+/// any non-zero usage shows at least one eighth, so a barely-touched limit
+/// still reads as touched.
 fn bar(percent: f64) -> String {
-    let clamped = percent.clamp(0.0, 100.0);
-    let filled = match clamped {
-        p if p <= 0.0 => 0,
-        p => ((p / 100.0) * BAR as f64).ceil() as usize,
-    }
-    .min(BAR);
-    format!("{}{}", "█".repeat(filled), "░".repeat(BAR - filled))
+    let steps = BAR * EIGHTHS.len();
+    let exact = (percent.clamp(0.0, 100.0) / 100.0) * steps as f64;
+    let touched = exact > 0.0;
+    let filled = (exact.floor() as usize).max(usize::from(touched));
+    let full = filled / EIGHTHS.len();
+    let partial = EIGHTHS[filled % EIGHTHS.len()];
+    let track = BAR - full - usize::from(!partial.is_empty());
+    format!("{}{partial}{}", "█".repeat(full), "░".repeat(track))
 }
 
 /// Time until an RFC 3339 instant, phrased for a glance.
@@ -625,12 +634,21 @@ mod tests {
     #[test]
     fn a_bar_is_empty_only_at_genuine_zero() {
         assert_eq!(bar(0.0), "░░░░");
-        assert_eq!(bar(0.4), "█░░░");
+        assert_eq!(bar(0.4), "▏░░░");
     }
 
     #[test]
-    fn a_bar_fills_proportionally_and_clamps_past_full() {
+    fn a_bar_rounds_down_to_the_eighth() {
+        assert_eq!(bar(6.0), "▏░░░");
+        assert_eq!(bar(43.0), "█▋░░");
         assert_eq!(bar(50.0), "██░░");
+        assert_eq!(bar(51.0), "██░░");
+        assert_eq!(bar(89.0), "███▌");
+    }
+
+    #[test]
+    fn a_bar_is_full_only_at_full_and_clamps_past_it() {
+        assert_eq!(bar(97.0), "███▉");
         assert_eq!(bar(100.0), "████");
         assert_eq!(bar(220.0), "████");
     }
