@@ -1176,17 +1176,38 @@ fn grant_of(entry: &Stashed) -> Grant {
     }
 }
 
+/// The account of `provider` a request pinned to `needle` goes out as. The
+/// needle is read the way `ccs use` reads one, among that provider's accounts
+/// only, so an address signed up with both providers names the right one.
+/// Ambiguity is reported in `resolve`'s words; a needle naming nothing, in
+/// the gateway's.
+fn pinned(accounts: &[Stashed], provider: Provider, needle: &str) -> Result<String> {
+    let mine: Vec<Stashed> =
+        accounts.iter().filter(|a| a.account.provider == provider).cloned().collect();
+    let lowered = needle.to_lowercase();
+    let named = mine.iter().any(|a| {
+        a.slug.starts_with(&lowered) || a.account.email.to_lowercase().starts_with(&lowered)
+    });
+    if !named {
+        bail!("no such account for {provider}: {needle}");
+    }
+    Ok(stash::resolve(&mine, needle)?.slug.clone())
+}
+
 impl serve::Accounts for Desk<'_> {
     fn grant_model(
         &self,
         provider: Provider,
         model: Option<&str>,
+        pin: Option<&str>,
         avoid: &[String],
     ) -> Result<Grant, String> {
         let routed = || -> Result<Grant> {
             let routing = crate::routing::Routing::read(self.ctx.stash.root())?;
-            let Some(rule) = model.and_then(|m| routing.matching(provider, m)) else {
-                return self.grant(provider, avoid).map_err(anyhow::Error::msg);
+            let rule = pin.is_none().then(|| model.and_then(|m| routing.matching(provider, m)));
+            // A client that named its account gets that one, route or no route.
+            let Some(rule) = rule.flatten() else {
+                return self.grant(provider, pin, avoid).map_err(anyhow::Error::msg);
             };
             let mut accounts = self.ctx.stash.list()?;
             // Validate every target before sending; never silently use another provider.
@@ -1206,11 +1227,19 @@ impl serve::Accounts for Desk<'_> {
         routed().map_err(|e| describe(&e))
     }
 
-    fn grant(&self, provider: Provider, avoid: &[String]) -> Result<Grant, String> {
+    fn grant(
+        &self,
+        provider: Provider,
+        pin: Option<&str>,
+        avoid: &[String],
+    ) -> Result<Grant, String> {
         let granted = || -> Result<Grant> {
             let mut accounts = self.ctx.stash.list()?;
             let live = self.live(&accounts)?;
-            let slug = self.choose(&accounts, provider, live.of(provider), avoid)?;
+            let slug = match pin {
+                Some(needle) => pinned(&accounts, provider, needle)?,
+                None => self.choose(&accounts, provider, live.of(provider), avoid)?,
+            };
             self.hand_out(&slug, &mut accounts, &live)
         };
         granted().map_err(|e| describe(&e))
@@ -2196,10 +2225,13 @@ mod tests {
         let ctx = fixture.ctx();
         let desk = Desk { ctx: &ctx, pool: &pool };
 
-        let codex = desk.grant(Provider::Codex, &[]).expect("grants");
+        let codex = desk.grant(Provider::Codex, None, &[]).expect("grants");
         assert_eq!((codex.slug.as_str(), codex.account_id.as_deref()), ("g", Some("acct-g@x")));
-        assert_eq!(desk.grant(Provider::Codex, &["g".into()]).expect("falls over").slug, "h");
-        assert_eq!(desk.grant(Provider::Claude, &["a".into()]).expect("falls over").slug, "b");
+        assert_eq!(desk.grant(Provider::Codex, None, &["g".into()]).expect("falls over").slug, "h");
+        assert_eq!(
+            desk.grant(Provider::Claude, None, &["a".into()]).expect("falls over").slug,
+            "b"
+        );
     }
 
     #[test]
@@ -2435,37 +2467,45 @@ mod tests {
         let desk = Desk { ctx: &ctx, pool: &fixture.pool };
         for _ in 0..4 {
             assert_eq!(
-                desk.grant_model(Provider::Claude, Some("claude-opus-test"), &[]).unwrap().slug,
+                desk.grant_model(Provider::Claude, Some("claude-opus-test"), None, &[])
+                    .unwrap()
+                    .slug,
                 "a"
             );
             assert_eq!(
-                desk.grant_model(Provider::Claude, Some("claude-fable-test"), &[]).unwrap().slug,
+                desk.grant_model(Provider::Claude, Some("claude-fable-test"), None, &[])
+                    .unwrap()
+                    .slug,
                 "b"
             );
         }
         assert_eq!(
-            desk.grant_model(Provider::Claude, Some("claude-fable-test"), &["b".into()])
+            desk.grant_model(Provider::Claude, Some("claude-fable-test"), None, &["b".into()])
                 .unwrap()
                 .slug,
             "a"
         );
         assert!(
-            desk.grant_model(Provider::Claude, Some("claude-opus-test"), &["a".into()]).is_err()
+            desk.grant_model(Provider::Claude, Some("claude-opus-test"), None, &["a".into()])
+                .is_err()
         );
-        assert_eq!(desk.grant_model(Provider::Claude, Some("unmatched"), &[]).unwrap().slug, "c");
+        assert_eq!(
+            desk.grant_model(Provider::Claude, Some("unmatched"), None, &[]).unwrap().slug,
+            "c"
+        );
         assert_eq!(fixture.stash.active(Provider::Claude).as_deref(), Some("c"));
         let mut changed = routing;
         changed.rules[0].accounts = vec!["b".into()];
         changed.write(fixture.stash.root()).unwrap();
         assert_eq!(
-            desk.grant_model(Provider::Claude, Some("claude-opus-test"), &[]).unwrap().slug,
+            desk.grant_model(Provider::Claude, Some("claude-opus-test"), None, &[]).unwrap().slug,
             "b"
         );
         changed.rules[0].accounts = vec!["missing".into()];
         changed.write(fixture.stash.root()).unwrap();
-        assert!(desk.grant_model(Provider::Claude, Some("claude-opus-test"), &[]).is_err());
+        assert!(desk.grant_model(Provider::Claude, Some("claude-opus-test"), None, &[]).is_err());
         std::fs::write(fixture.stash.root().join(crate::routing::FILE), "invalid").unwrap();
-        assert!(desk.grant_model(Provider::Claude, Some("claude-opus-test"), &[]).is_err());
+        assert!(desk.grant_model(Provider::Claude, Some("claude-opus-test"), None, &[]).is_err());
     }
 
     #[test]
@@ -2517,8 +2557,9 @@ mod tests {
     fn a_grant_is_the_account_in_use() {
         let fixture = desk_fixture("desk-active", Some("b"), &[]);
         let ctx = fixture.ctx();
-        let grant =
-            Desk { ctx: &ctx, pool: &fixture.pool }.grant(Provider::Claude, &[]).expect("grants");
+        let grant = Desk { ctx: &ctx, pool: &fixture.pool }
+            .grant(Provider::Claude, None, &[])
+            .expect("grants");
         assert_eq!((grant.slug.as_str(), grant.token.as_str()), ("b", "access-r-b"));
         assert_eq!(grant.email, "b@example.com");
     }
@@ -2528,9 +2569,9 @@ mod tests {
         let fixture = desk_fixture("desk-pool", Some("b"), &["c", "a"]);
         let ctx = fixture.ctx();
         let desk = Desk { ctx: &ctx, pool: &fixture.pool };
-        assert_eq!(desk.grant(Provider::Claude, &["b".into()]).expect("grants").slug, "c");
+        assert_eq!(desk.grant(Provider::Claude, None, &["b".into()]).expect("grants").slug, "c");
         assert_eq!(
-            desk.grant(Provider::Claude, &["b".into(), "c".into()]).expect("grants").slug,
+            desk.grant(Provider::Claude, None, &["b".into(), "c".into()]).expect("grants").slug,
             "a"
         );
     }
@@ -2540,7 +2581,7 @@ mod tests {
         let fixture = desk_fixture("desk-spent", Some("b"), &["a"]);
         let ctx = fixture.ctx();
         let why = Desk { ctx: &ctx, pool: &fixture.pool }
-            .grant(Provider::Claude, &["b".into(), "a".into()])
+            .grant(Provider::Claude, None, &["b".into(), "a".into()])
             .expect_err("nothing left");
         assert!(why.contains("limited"), "{why}");
     }
@@ -2550,7 +2591,7 @@ mod tests {
         let fixture = desk_fixture("desk-none", None, &[]);
         let ctx = fixture.ctx();
         let why = Desk { ctx: &ctx, pool: &fixture.pool }
-            .grant(Provider::Claude, &[])
+            .grant(Provider::Claude, None, &[])
             .expect_err("nothing in use");
         assert!(why.contains("ccs use"), "{why}");
     }
@@ -2561,11 +2602,81 @@ mod tests {
         let ctx = fixture.ctx();
         assert_eq!(
             Desk { ctx: &ctx, pool: &fixture.pool }
-                .grant(Provider::Claude, &[])
+                .grant(Provider::Claude, None, &[])
                 .expect("grants")
                 .slug,
             "c"
         );
+    }
+
+    #[test]
+    fn a_pinned_grant_is_the_account_named_whatever_is_in_use_or_pooled() {
+        let fixture = desk_fixture("desk-pinned", Some("b"), &["c"]);
+        let ctx = fixture.ctx();
+        let desk = Desk { ctx: &ctx, pool: &fixture.pool };
+        let grant = desk.grant(Provider::Claude, Some("a"), &[]).expect("grants");
+        assert_eq!((grant.slug.as_str(), grant.token.as_str()), ("a", "access-r-a"));
+        // By email, and by prefix; the account in use is as good a pin as any.
+        assert_eq!(desk.grant(Provider::Claude, Some("c@example.com"), &[]).unwrap().slug, "c");
+        assert_eq!(desk.grant(Provider::Claude, Some("b@ex"), &[]).unwrap().slug, "b");
+        assert_eq!(fixture.stash.active(Provider::Claude).as_deref(), Some("b"));
+        assert_eq!(
+            desk.grant(Provider::Claude, Some("nobody"), &[]).unwrap_err(),
+            "no such account for claude: nobody"
+        );
+    }
+
+    #[test]
+    fn a_pin_outranks_a_model_route() {
+        use crate::routing::{Routing, Rule};
+        let fixture = desk_fixture("desk-pin-over-route", Some("c"), &[]);
+        let routing = Routing {
+            rules: vec![Rule {
+                provider: Provider::Claude,
+                model: "claude-opus-*".into(),
+                accounts: vec!["a".into()],
+            }],
+        };
+        routing.write(fixture.stash.root()).unwrap();
+        let ctx = fixture.ctx();
+        let desk = Desk { ctx: &ctx, pool: &fixture.pool };
+        let routed = desk.grant_model(Provider::Claude, Some("claude-opus-test"), None, &[]);
+        assert_eq!(routed.unwrap().slug, "a");
+        let pinned = desk.grant_model(Provider::Claude, Some("claude-opus-test"), Some("b"), &[]);
+        assert_eq!(pinned.unwrap().slug, "b");
+    }
+
+    /// One address signed up with both providers is two accounts; a pin on
+    /// one provider's route names that provider's.
+    #[test]
+    fn a_pin_is_resolved_among_the_providers_own_accounts() {
+        let mut shared = stashed("shared_claude", oauth("r-1", LATER));
+        shared.account.email = "shared@example.com".into();
+        let mut twin =
+            codex_stashed("shared_codex", codex_oauth("r-2", LATER, "shared@example.com"));
+        twin.account.email = "shared@example.com".into();
+        let other = stashed("other", oauth("r-3", LATER));
+        let accounts = vec![shared, twin, other];
+
+        assert_eq!(
+            pinned(&accounts, Provider::Claude, "shared@example.com").unwrap(),
+            "shared_claude"
+        );
+        assert_eq!(
+            pinned(&accounts, Provider::Codex, "shared@example.com").unwrap(),
+            "shared_codex"
+        );
+        assert_eq!(pinned(&accounts, Provider::Claude, "SHARED_C").unwrap(), "shared_claude");
+        assert_eq!(
+            describe(&pinned(&accounts, Provider::Codex, "other").unwrap_err()),
+            "no such account for codex: other"
+        );
+        // An ambiguous prefix is reported in `resolve`'s own words.
+        let mut alike = stashed("shared_claude2", oauth("r-4", LATER));
+        alike.account.email = "shared2@example.com".into();
+        let accounts = [accounts, vec![alike]].concat();
+        let why = describe(&pinned(&accounts, Provider::Claude, "shared").unwrap_err());
+        assert!(why.contains("ambiguous"), "{why}");
     }
 
     /// A session refreshing the live credentials leaves the stash behind. A
@@ -2577,7 +2688,7 @@ mod tests {
         fixture.creds.write(&CredsFile::new(oauth("r-b-2", LATER + 1))).expect("live");
         let ctx = fixture.ctx();
         let desk = Desk { ctx: &ctx, pool: &fixture.pool };
-        let old = desk.grant(Provider::Claude, &[]).expect("grants");
+        let old = desk.grant(Provider::Claude, None, &[]).expect("grants");
 
         let renewed = desk.stale(&old).expect("answers").expect("a newer copy");
         assert_eq!(renewed.token, "access-r-b-2");
@@ -2596,8 +2707,9 @@ mod tests {
         fixture.creds.write(&CredsFile::new(oauth("r-b-2", LATER))).expect("live");
         let ctx = fixture.ctx();
 
-        let grant =
-            Desk { ctx: &ctx, pool: &fixture.pool }.grant(Provider::Claude, &[]).expect("grants");
+        let grant = Desk { ctx: &ctx, pool: &fixture.pool }
+            .grant(Provider::Claude, None, &[])
+            .expect("grants");
 
         assert_eq!(grant.token, "access-r-b-2");
         assert_eq!(fixture.tokens("b").0, "r-b-2");
@@ -2608,7 +2720,7 @@ mod tests {
         let fixture = desk_fixture("desk-fresh", Some("b"), &[]);
         let ctx = fixture.ctx();
         let desk = Desk { ctx: &ctx, pool: &fixture.pool };
-        let grant = desk.grant(Provider::Claude, &[]).expect("grants");
+        let grant = desk.grant(Provider::Claude, None, &[]).expect("grants");
         assert!(desk.stale(&grant).expect("answers").is_none());
     }
 }
