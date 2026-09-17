@@ -89,11 +89,10 @@ with tempfile.TemporaryDirectory(prefix='ccs-msg-') as tmp:
         delivered = (root / 'delivered').read_text()
         assert payload in delivered and 'bob-thread' in delivered
         assert 'CCS_SERVER_DIR=' not in delivered and 'ccs reply' not in delivered
-        reply_args = json.loads(delivered.rsplit('Reply via MCP: ccs(', 1)[1].strip()[:-1])
-        assert reply_args['op'] == 'reply' and reply_args['session'] == 'bob'
+        assert 'Reply via' not in delivered and 'Reply using' not in delivered
         pending = run('inbox', session='bob')['messages']
         q = next(x for x in pending if x['kind'] == 'queue')
-        assert reply_args['id'] == q['id']
+        assert f"From: alice\nTo: bob\nMessage-ID: {q['id']}\n" in delivered
         run('inbox', 'ack', q['id'], session='bob', ok=False)
         run('reply', q['id'], '--message', 'string', session='bob')
         stdout, stderr = waiting.communicate(timeout=8)
@@ -144,14 +143,13 @@ with tempfile.TemporaryDirectory(prefix='ccs-msg-') as tmp:
                     assert message['from_mode'] == 'bypass'
                     assert message['priority'] == 'next'
                     text = message['message']['content']
-                    mid = text.split('CCS request ', 1)[1].split()[0]
+                    mid = text.split('Message-ID: ', 1)[1].splitlines()[0]
                     assert 'CCS_SERVER_DIR=' not in text and 'ccs reply' not in text
-                    guide = json.loads(text.rsplit('Reply via MCP: ccs(', 1)[1].splitlines()[0][:-1])
-                    assert guide['id'] == mid and guide['session'] == 'carol'
-                guide['text'] = 'Claude answer'
+                    assert 'Reply via' not in text and 'Reply using' not in text
+                reply_args = {'op':'reply', 'id':mid, 'session':'carol', 'text':'Claude answer'}
                 frames = [
                     {'jsonrpc':'2.0', 'id':1, 'method':'initialize', 'params':{'protocolVersion':'2025-11-25'}},
-                    {'jsonrpc':'2.0', 'id':2, 'method':'tools/call', 'params':{'name':'ccs', 'arguments':guide}},
+                    {'jsonrpc':'2.0', 'id':2, 'method':'tools/call', 'params':{'name':'ccs', 'arguments':reply_args}},
                 ]
                 reply = subprocess.run([binary, 'mcp'], env=claude_env,
                     input=''.join(json.dumps(frame) + '\n' for frame in frames),
