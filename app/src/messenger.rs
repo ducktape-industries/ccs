@@ -159,6 +159,7 @@ pub struct Messenger {
     scroll: ScrollHandle,
     new_messages: usize,
     thread_cache: Vec<Message>,
+    scroll_anchor: Option<String>,
     revision: u64,
     subscription: Option<Subscription>,
     stream_epoch: u64,
@@ -191,6 +192,7 @@ impl Messenger {
             scroll: ScrollHandle::new(),
             new_messages: 0,
             thread_cache: vec![],
+            scroll_anchor: None,
             revision: 0,
             subscription: None,
             stream_epoch: 0,
@@ -356,6 +358,9 @@ impl Messenger {
                     self.remote_form = false;
                 }
                 if self.session != snapshot.session {
+                    self.messages.clear();
+                    self.thread_cache.clear();
+                    self.scroll_anchor = None;
                     self.reset_answer = true;
                     self.selected = None;
                     self.offset = 0;
@@ -366,25 +371,49 @@ impl Messenger {
                 let at_bottom = self.scroll.max_offset().y + self.scroll.offset().y <= px(24.);
                 let latest = self.messages.iter().map(|m| m.sequence).max().unwrap_or(0);
                 let added = snapshot.page.messages.iter().filter(|m| m.sequence > latest).count();
-                if self.messages.is_empty() || at_bottom {
+                // Keep loaded history while the room is open. A moving recent window must
+                // not remove the messages a reader is looking at.
+                let top = self.scroll.top_item();
+                let roots: Vec<_> = self
+                    .messages
+                    .iter()
+                    .filter(|m| root_id(&self.messages, &m.id) == m.id)
+                    .collect();
+                let anchor = roots
+                    .get(top.saturating_sub(usize::from(self.next_offset.is_some())))
+                    .map(|m| m.id.clone());
+                let prepending = snapshot
+                    .page
+                    .messages
+                    .first()
+                    .zip(self.messages.first())
+                    .is_some_and(|(new, old)| new.sequence < old.sequence);
+                if self.messages.is_empty() || (at_bottom && !prepending) {
                     self.scroll.scroll_to_bottom();
+                    self.new_messages = 0;
                 } else {
+                    self.scroll_anchor = anchor;
                     self.new_messages += added;
                 }
-                if let Some(id) = &self.selected {
-                    let root = root_id(&self.messages, id);
-                    self.thread_cache = self
-                        .messages
-                        .iter()
-                        .filter(|m| root_id(&self.messages, &m.id) == root)
-                        .cloned()
-                        .collect();
+                let mut merged: BTreeMap<_, _> =
+                    self.messages.drain(..).map(|m| (m.id.clone(), m)).collect();
+                for message in snapshot.page.messages {
+                    merged.insert(message.id.clone(), message);
                 }
-                self.messages = snapshot.page.messages;
-                for m in &mut self.thread_cache {
-                    if let Some(updated) = self.messages.iter().find(|new| new.id == m.id) {
-                        *m = updated.clone();
+                self.messages = merged.into_values().collect();
+                self.messages.sort_by_key(|m| m.sequence);
+                if let Some(id) = &self.selected {
+                    let mut all = self.thread_cache.clone();
+                    for message in &self.messages {
+                        if let Some(old) = all.iter_mut().find(|m| m.id == message.id) {
+                            *old = message.clone();
+                        } else {
+                            all.push(message.clone());
+                        }
                     }
+                    let root = root_id(&all, id);
+                    self.thread_cache =
+                        all.iter().filter(|m| root_id(&all, &m.id) == root).cloned().collect();
                 }
                 self.next_offset = snapshot.page.next_offset;
                 if !self
@@ -415,6 +444,7 @@ impl Messenger {
         self.next_offset = None;
         self.new_messages = 0;
         self.thread_cache.clear();
+        self.scroll_anchor = None;
         self.note.clear();
     }
 
@@ -720,6 +750,18 @@ impl Render for Messenger {
                 );
             }
             room = room.child(people);
+        }
+        if let Some(id) = self.scroll_anchor.take()
+            && let Some(index) = self
+                .messages
+                .iter()
+                .filter(|m| root_id(&self.messages, &m.id) == m.id)
+                .position(|m| m.id == id)
+        {
+            let index = index + usize::from(self.next_offset.is_some());
+            if index != self.scroll.top_item() {
+                self.scroll.scroll_to_top_of_item(index);
+            }
         }
         let mut timeline = div()
             .id("message-list")
@@ -1173,6 +1215,93 @@ mod tests {
             assert!(window.try_find("message-list").is_some());
         })
         .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn repeated_refresh_preserves_history_thread_and_viewport(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let mut entity = None;
+        let handle = cx.add_window(|window, cx| {
+            let view = cx.new(|cx| {
+                let mut view = Messenger::new(window, cx);
+                let mut initial = snapshot("local");
+                let template = initial.page.messages[0].clone();
+                initial.page.messages = (10..40)
+                    .map(|sequence| {
+                        let mut m = template.clone();
+                        m.id = format!("m{sequence}");
+                        m.sequence = sequence;
+                        m
+                    })
+                    .collect();
+                initial.page.next_offset = Some(20);
+                view.finish_load(0, None, Ok(initial));
+                view
+            });
+            entity = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let view = entity.unwrap();
+        cx.simulate_window_resize(
+            handle.into(),
+            gpui_kit::size(gpui_kit::px(1100.), gpui_kit::px(620.)),
+        );
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            view.update(cx, |v, _| v.scroll.scroll_to_top_of_item(5));
+            window.render_frame(cx);
+            view.update(cx, |v, _| {
+                let mut offset = v.scroll.offset();
+                offset.y -= gpui_kit::px(7.);
+                v.scroll.set_offset(offset);
+            });
+            window.render_frame(cx);
+        })
+        .unwrap();
+        let before = view.read_with(cx, |v, _| v.scroll.logical_scroll_top());
+        assert_eq!(before.0, 5);
+        for sequence in [40, 41, 9] {
+            view.update(cx, |v, cx| {
+                let mut fresh = snapshot("local");
+                fresh.page.messages[0].id = format!("m{sequence}");
+                fresh.page.messages[0].sequence = sequence;
+                fresh.page.next_offset = Some(20);
+                v.finish_load(0, None, Ok(fresh));
+                assert!(v.messages.iter().any(|m| m.id == "m10"));
+                cx.notify();
+            });
+            cx.run_until_parked();
+            cx.update_window(handle.into(), |_, window, cx| window.render_frame(cx)).unwrap();
+            cx.run_until_parked();
+            cx.update_window(handle.into(), |_, window, cx| window.render_frame(cx)).unwrap();
+            cx.run_until_parked();
+            view.read_with(cx, |v, _| {
+                let (index, within) = v.scroll.logical_scroll_top();
+                assert_eq!(
+                    v.messages[index - 1].id,
+                    "m14",
+                    "sequence={sequence}, before={before:?}, after={:?}",
+                    v.scroll.logical_scroll_top()
+                );
+                if sequence == 9 {
+                    assert_eq!(within, gpui_kit::px(0.));
+                } else {
+                    assert!((within - before.1).abs() < gpui_kit::px(1.));
+                }
+            });
+        }
+        view.update(cx, |v, _| {
+            v.selected = Some("m10".into());
+            let mut reply = v.messages.iter().find(|m| m.id == "m10").unwrap().clone();
+            reply.id = "reply".into();
+            reply.reply_to = Some("m10".into());
+            v.thread_cache.push(reply);
+            for _ in 0..3 {
+                v.finish_load(0, None, Ok(snapshot("local")));
+                assert!(v.thread_cache.iter().any(|m| m.id == "reply"));
+            }
+        });
     }
 
     #[gpui_kit::test]
