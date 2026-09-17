@@ -1,5 +1,6 @@
 //! Session-based inbox/queue viewer. Local first; remote is an explicit connection.
 use futures::{SinkExt, StreamExt};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{
     Arc,
@@ -75,30 +76,72 @@ struct Snapshot {
     page: MessagePage,
 }
 
+fn recent_messages(messages: Vec<Message>, count: usize) -> (Vec<Message>, bool) {
+    let unique: BTreeMap<_, _> = messages.into_iter().map(|m| (m.id.clone(), m)).collect();
+    let mut messages: Vec<_> = unique.into_values().collect();
+    messages.sort_by_key(|m| std::cmp::Reverse(m.sequence));
+    let more = messages.len() > count;
+    messages.truncate(count);
+    (messages, more)
+}
+
 fn load(
     connection: &Connection,
     selected: Option<String>,
     kind: Option<Kind>,
     offset: usize,
+    pinned: Option<Message>,
 ) -> Result<Snapshot, String> {
     let load = || -> anyhow::Result<Snapshot> {
         let sessions: Vec<SessionRow> =
             serde_json::from_value(connection.call(&Request::Sessions { labels: Labels::new() })?)?;
-        let original = selected.clone();
-        let session = selected
-            .filter(|name| sessions.iter().any(|s| &s.name == name))
-            .or_else(|| sessions.first().map(|s| s.name.clone()));
-        let offset = if session == original { offset } else { 0 };
-        let page = if let Some(name) = &session {
-            serde_json::from_value(connection.call(&Request::History {
-                session: name.clone(),
-                kind,
-                limit: 20,
-                offset,
-            })?)?
-        } else {
-            MessagePage::default()
-        };
+        let session = selected.filter(|name| sessions.iter().any(|s| &s.name == name));
+        let count = offset + 20;
+        let mut merged = Vec::new();
+        for row in sessions.iter().filter(|s| session.as_ref().is_none_or(|n| n == &s.name)) {
+            let mut cursor = 0;
+            while cursor <= count {
+                let page: MessagePage =
+                    serde_json::from_value(connection.call(&Request::History {
+                        session: row.name.clone(),
+                        kind,
+                        limit: (count + 1 - cursor).min(100),
+                        offset: cursor,
+                    })?)?;
+                merged.extend(page.messages);
+                let Some(next) = page.next_offset else { break };
+                if next <= cursor {
+                    break;
+                }
+                cursor = next;
+            }
+        }
+        let (mut messages, more) = recent_messages(merged, count);
+        let next_offset = more.then_some(offset + 20);
+        if let Some(pinned) = pinned {
+            let current: Message = serde_json::from_value(
+                connection.call(&Request::Message { session: pinned.to, id: pinned.id })?,
+            )?;
+            if let Some(existing) = messages.iter_mut().find(|m| m.id == current.id) {
+                *existing = current;
+            } else {
+                messages.push(current);
+            }
+        }
+        // Fetch ancestors for replies whose original fell outside the recent window.
+        let mut index = 0;
+        while index < messages.len() && messages.len() < count + 100 {
+            if let Some(parent) = messages[index].reply_to.clone()
+                && !messages.iter().any(|m| m.id == parent)
+            {
+                let value = connection
+                    .call(&Request::Message { session: messages[index].to.clone(), id: parent })?;
+                messages.push(serde_json::from_value(value)?);
+            }
+            index += 1;
+        }
+        messages.sort_by_key(|m| m.sequence);
+        let page = MessagePage { messages, next_offset };
         Ok(Snapshot { sessions, session, page })
     };
     load().map_err(|e| format!("{e:#}"))
@@ -113,7 +156,9 @@ pub struct Messenger {
     kind: Option<Kind>,
     offset: usize,
     next_offset: Option<usize>,
-    previous: Vec<usize>,
+    scroll: ScrollHandle,
+    new_messages: usize,
+    thread_cache: Vec<Message>,
     revision: u64,
     subscription: Option<Subscription>,
     stream_epoch: u64,
@@ -143,7 +188,9 @@ impl Messenger {
             kind: None,
             offset: 0,
             next_offset: None,
-            previous: vec![],
+            scroll: ScrollHandle::new(),
+            new_messages: 0,
+            thread_cache: vec![],
             revision: 0,
             subscription: None,
             stream_epoch: 0,
@@ -256,10 +303,20 @@ impl Messenger {
         let session = if candidate.is_some() { None } else { self.session.clone() };
         let kind = if candidate.is_some() { None } else { self.kind };
         let offset = if candidate.is_some() { 0 } else { self.offset };
+        let pinned = if candidate.is_some() {
+            None
+        } else {
+            self.messages
+                .iter()
+                .chain(&self.thread_cache)
+                .find(|m| Some(&m.id) == self.selected.as_ref())
+                .cloned()
+        };
         self.loading = true;
         self.error.clear();
-        let task =
-            cx.background_executor().spawn(async move { load(&connection, session, kind, offset) });
+        let task = cx
+            .background_executor()
+            .spawn(async move { load(&connection, session, kind, offset, pinned) });
         cx.spawn(async move |this, cx| {
             let result = task.await;
             let _ = this.update(cx, |this, cx| {
@@ -302,13 +359,40 @@ impl Messenger {
                     self.reset_answer = true;
                     self.selected = None;
                     self.offset = 0;
-                    self.previous.clear();
+                    self.new_messages = 0;
                 }
                 self.sessions = snapshot.sessions;
                 self.session = snapshot.session;
+                let at_bottom = self.scroll.max_offset().y + self.scroll.offset().y <= px(24.);
+                let latest = self.messages.iter().map(|m| m.sequence).max().unwrap_or(0);
+                let added = snapshot.page.messages.iter().filter(|m| m.sequence > latest).count();
+                if self.messages.is_empty() || at_bottom {
+                    self.scroll.scroll_to_bottom();
+                } else {
+                    self.new_messages += added;
+                }
+                if let Some(id) = &self.selected {
+                    let root = root_id(&self.messages, id);
+                    self.thread_cache = self
+                        .messages
+                        .iter()
+                        .filter(|m| root_id(&self.messages, &m.id) == root)
+                        .cloned()
+                        .collect();
+                }
                 self.messages = snapshot.page.messages;
+                for m in &mut self.thread_cache {
+                    if let Some(updated) = self.messages.iter().find(|new| new.id == m.id) {
+                        *m = updated.clone();
+                    }
+                }
                 self.next_offset = snapshot.page.next_offset;
-                if !self.messages.iter().any(|m| Some(&m.id) == self.selected.as_ref()) {
+                if !self
+                    .messages
+                    .iter()
+                    .chain(&self.thread_cache)
+                    .any(|m| Some(&m.id) == self.selected.as_ref())
+                {
                     self.selected = None;
                 }
                 self.connected = true;
@@ -329,23 +413,19 @@ impl Messenger {
         self.selected = None;
         self.offset = 0;
         self.next_offset = None;
-        self.previous.clear();
+        self.new_messages = 0;
+        self.thread_cache.clear();
         self.note.clear();
     }
 
-    fn choose_session(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
+    fn choose_session(
+        &mut self,
+        name: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.clear_selection();
-        self.session = Some(name);
-        self.answer.update(cx, |input, cx| input.set_value("", window, cx));
-        self.start_load(None, cx);
-    }
-
-    fn change_kind(&mut self, kind: Option<Kind>, window: &mut Window, cx: &mut Context<Self>) {
-        self.kind = kind;
-        self.messages.clear();
-        self.selected = None;
-        self.offset = 0;
-        self.previous.clear();
+        self.session = name;
         self.answer.update(cx, |input, cx| input.set_value("", window, cx));
         self.start_load(None, cx);
     }
@@ -365,19 +445,15 @@ impl Messenger {
         if self.writing || self.loading || !self.connected {
             return;
         }
-        let Some(session) = self.session.clone() else {
-            return;
-        };
         let Some(id) = self.selected.clone() else {
             return;
         };
-        let Some(message) = self.messages.iter().find(|m| m.id == id) else {
+        let Some(message) = self.messages.iter().chain(&self.thread_cache).find(|m| m.id == id)
+        else {
             return;
         };
-        if message.to != session
-            || (reply && message.reply.is_some())
-            || (!reply && message.kind != Kind::Inbox)
-        {
+        let session = message.to.clone();
+        if (reply && message.reply.is_some()) || (!reply && message.kind != Kind::Inbox) {
             return;
         }
         let body = self.answer.read(cx).value().to_string();
@@ -424,58 +500,54 @@ impl Messenger {
 
     fn connection_header(&self, cx: &mut Context<Self>) -> Div {
         let remote = matches!(self.connection, Connection::Remote { .. });
-        let mut header = div()
-            .v_flex()
-            .gap_3()
-            .p_4()
-            .rounded_lg()
-            .bg(rgb(0xf5f7fa))
-            .child(
+        let state = if self.loading {
+            "Updating…"
+        } else if self.streaming {
+            "● Live"
+        } else if self.connected {
+            "Connected"
+        } else {
+            "Offline"
+        };
+        let mut header =
+            div().v_flex().gap_2().pb_3().border_b_1().border_color(rgb(0xe5e7eb)).child(
                 div()
                     .flex()
                     .items_center()
                     .gap_3()
+                    .child(div().font_semibold().child(self.connection.title()))
                     .child(
                         div()
-                            .flex_1()
-                            .v_flex()
-                            .gap_1()
-                            .child(div().font_semibold().child(self.connection.title()))
-                            .child(crate::muted(if self.loading {
-                                "Connecting / refreshing…".into()
-                            } else if self.connected {
-                                format!(
-                                    "{} · {} registered sessions",
-                                    if self.streaming { "Live" } else { "Connected" },
-                                    self.sessions.len()
-                                )
-                            } else {
-                                "Messenger is not connected".into()
-                            })),
+                            .text_xs()
+                            .text_color(if self.streaming { rgb(0x067647) } else { rgb(0x737373) })
+                            .child(state),
                     )
-                    .child(
-                        Button::new("messenger-refresh")
-                            .small()
-                            .label("Refresh")
-                            .disabled(self.loading || self.writing)
-                            .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(crate::muted(if remote {
-                        "Viewing messages on the remote CCS server."
-                    } else {
-                        "Your current CCS sessions, inbox and queue."
-                    }))
+                    .child(div().flex_1())
+                    .when(remote, |row| {
+                        row.child(
+                            Button::new("back-local-ccs")
+                                .small()
+                                .ghost()
+                                .label("Back to local")
+                                .disabled(self.writing)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.connection = Connection::local();
+                                    this.start_watch(cx);
+                                    this.clear_selection();
+                                    this.sessions.clear();
+                                    this.kind = None;
+                                    this.connected = false;
+                                    this.answer
+                                        .update(cx, |input, cx| input.set_value("", window, cx));
+                                    this.start_load(None, cx);
+                                })),
+                        )
+                    })
                     .child(
                         Button::new("view-remote-ccs")
                             .small()
                             .ghost()
-                            .label(if remote { "Change remote" } else { "View remote CCS →" })
+                            .label(if remote { "Change server" } else { "View remote CCS →" })
                             .disabled(self.loading || self.writing)
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.remote_form = !this.remote_form;
@@ -484,28 +556,8 @@ impl Messenger {
                     ),
             );
         if !self.stream_error.is_empty() {
-            header = header.child(
-                crate::muted(format!("Reconnecting live updates… {}", self.stream_error)).text_xs(),
-            );
-        }
-        if remote {
-            header = header.child(
-                Button::new("back-local-ccs")
-                    .small()
-                    .ghost()
-                    .label("← Back to local CCS")
-                    .disabled(self.writing)
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.connection = Connection::local();
-                        this.start_watch(cx);
-                        this.clear_selection();
-                        this.sessions.clear();
-                        this.kind = None;
-                        this.connected = false;
-                        this.answer.update(cx, |input, cx| input.set_value("", window, cx));
-                        this.start_load(None, cx);
-                    })),
-            );
+            header = header
+                .child(crate::muted(format!("Reconnecting… {}", self.stream_error)).text_xs());
         }
         if self.remote_form {
             header = header.child(
@@ -562,8 +614,38 @@ fn status_color(message: &Message) -> Rgba {
         _ => rgb(0x946200),
     }
 }
-fn short_body(body: &str) -> String {
-    body.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(100).collect()
+fn root_id(messages: &[Message], id: &str) -> String {
+    let mut current = id;
+    for _ in 0..messages.len() {
+        match messages.iter().find(|m| m.id == current).and_then(|m| m.reply_to.as_deref()) {
+            Some(parent) if messages.iter().any(|m| m.id == parent) => current = parent,
+            _ => break,
+        }
+    }
+    current.to_string()
+}
+
+fn message_time(message: &Message) -> String {
+    jiff::Timestamp::from_millisecond(message.created_ms)
+        .map(|t| t.to_zoned(jiff::tz::TimeZone::system()).strftime("%H:%M").to_string())
+        .unwrap_or_default()
+}
+
+fn avatar(name: &str) -> Div {
+    div()
+        .size(px(30.))
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded_md()
+        .bg(rgb(0xe9edf7))
+        .text_color(rgb(0x425a8b))
+        .text_xs()
+        .font_semibold()
+        .child(
+            name.trim_start_matches("ducktape-").chars().take(2).collect::<String>().to_uppercase(),
+        )
 }
 
 impl Render for Messenger {
@@ -572,12 +654,14 @@ impl Render for Messenger {
             self.answer.update(cx, |input, cx| input.set_value("", window, cx));
             self.reset_answer = false;
         }
-        let mut content = div().v_flex().gap_4().child(self.connection_header(cx));
+        let height = (window.viewport_size().height - px(160.)).max(px(340.));
+        let narrow = window.viewport_size().width < px(900.);
+        let mut content = div().v_flex().h(height).gap_3().child(self.connection_header(cx));
         if !self.error.is_empty() {
             content = content.child(
                 div()
                     .id("messenger-error")
-                    .p_3()
+                    .p_2()
                     .rounded_md()
                     .bg(rgb(0xfff4ed))
                     .text_color(rgb(0x9a3412))
@@ -586,86 +670,100 @@ impl Render for Messenger {
         }
         if self.sessions.is_empty() {
             return content.child(div().id("messenger-empty").v_flex().gap_2().py_6()
-                .child(div().font_semibold().child(if self.connected { "No registered sessions yet" } else { "Connect to your local messenger" }))
-                .child(crate::muted(if self.connected { "Register an existing Claude or Codex session with ccs session register." } else { "Run ccs server on this machine, then refresh. You can also view a remote CCS server above." })));
+                .child(div().font_semibold().child(if self.connected { "No participants yet" } else { "Local CCS is offline" }))
+                .child(crate::muted("Registered sessions appear here. Connect your local CCS or view a remote server.")));
         }
-        let mut sessions = div()
-            .w(px(185.))
-            .flex_shrink_0()
-            .v_flex()
-            .gap_2()
-            .child(crate::muted("SESSIONS").text_xs());
-        for session in &self.sessions {
-            let name = session.name.clone();
-            sessions = sessions.child(
+        let mut all = self.messages.clone();
+        for message in &self.thread_cache {
+            if !all.iter().any(|m| m.id == message.id) {
+                all.push(message.clone());
+            }
+        }
+        all.sort_by_key(|m| m.sequence);
+        let selected =
+            self.selected.as_ref().and_then(|id| all.iter().find(|m| &m.id == id)).cloned();
+        let mut room = div().flex_1().min_w_0().v_flex().gap_2();
+        room =
+            room.child(
                 div()
-                    .v_flex()
-                    .gap_1()
-                    .p_2()
-                    .rounded_md()
-                    .when(self.session.as_ref() == Some(&name), |d| d.bg(rgb(0xeff6ff)))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(div().font_semibold().child(
+                        self.session.clone().unwrap_or_else(|| "# All conversations".into()),
+                    ))
                     .child(
-                        Button::new(SharedString::from(format!("session-{name}")))
+                        Button::new("room-all")
                             .small()
                             .ghost()
-                            .label(name.clone())
-                            .selected(self.session.as_ref() == Some(&name))
+                            .label("All participants")
                             .disabled(self.writing)
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.choose_session(name.clone(), window, cx)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.choose_session(None, window, cx)
                             })),
-                    )
-                    .child(crate::muted(session.provider.clone()).text_xs())
-                    .children(
-                        session
-                            .labels
-                            .iter()
-                            .map(|(k, v)| crate::muted(format!("{k}={v}")).text_xs()),
                     ),
             );
+        if narrow {
+            let mut people = div().id("participant-strip").flex().gap_1().overflow_x_scroll();
+            for session in &self.sessions {
+                let name = session.name.clone();
+                people = people.child(
+                    Button::new(SharedString::from(format!("session-{name}")))
+                        .small()
+                        .ghost()
+                        .label(name.clone())
+                        .selected(self.session.as_ref() == Some(&name))
+                        .disabled(self.writing)
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.choose_session(Some(name.clone()), window, cx)
+                        })),
+                );
+            }
+            room = room.child(people);
         }
-        let mut flow = div().flex_1().min_w_0().v_flex().gap_3();
-        let mut filters = div().flex().items_center().gap_1();
-        for (id, title, kind) in [
-            ("flow-all", "All activity", None),
-            ("flow-inbox", "Inbox", Some(Kind::Inbox)),
-            ("flow-queue", "Queue", Some(Kind::Queue)),
-        ] {
-            filters = filters.child(
-                Button::new(id)
+        let mut timeline = div()
+            .id("message-list")
+            .test_support()
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .track_scroll(&self.scroll)
+            .v_flex()
+            .gap_1();
+        if self.next_offset.is_some() {
+            timeline = timeline.child(
+                Button::new("messages-next")
                     .small()
                     .ghost()
-                    .label(title)
-                    .selected(self.kind == kind)
-                    .disabled(self.writing)
-                    .on_click(
-                        cx.listener(move |this, _, window, cx| this.change_kind(kind, window, cx)),
-                    ),
+                    .label("Load earlier messages")
+                    .disabled(self.loading || self.writing)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if let Some(offset) = this.next_offset {
+                            this.offset = offset;
+                            this.start_load(None, cx);
+                        }
+                    })),
             );
         }
-        flow = flow.child(filters).child(
-            crate::muted(
-                "Incoming and outgoing · newest first · viewing does not mark messages read",
-            )
-            .text_xs(),
-        );
-        let mut list =
-            div().id("message-list").v_flex().gap_2().max_h(px(250.)).overflow_y_scroll();
-        for message in &self.messages {
+        for message in self.messages.iter().filter(|m| root_id(&self.messages, &m.id) == m.id) {
             let id = message.id.clone();
-            let selected = self.selected.as_ref() == Some(&id);
-            list = list.child(
+            let selected_root = selected.as_ref().map(|m| root_id(&all, &m.id));
+            let descendants =
+                all.iter().filter(|m| m.id != id && root_id(&all, &m.id) == id).count();
+            let replies = descendants + usize::from(message.reply.is_some() && descendants == 0);
+            let preview: String = message.body.chars().take(420).collect();
+            let preview =
+                if preview.len() < message.body.len() { format!("{preview}…") } else { preview };
+            timeline = timeline.child(
                 div()
                     .id(SharedString::from(format!("message-{id}")))
                     .test_support()
+                    .flex()
+                    .gap_3()
                     .p_3()
-                    .border_1()
                     .rounded_md()
-                    .border_color(if selected { rgb(0x3b82f6) } else { rgb(0xe5e7eb) })
-                    .when(selected, |d| d.bg(rgb(0xf5f9ff)))
                     .cursor_pointer()
-                    .v_flex()
-                    .gap_1()
+                    .when(selected_root.as_ref() == Some(&id), |d| d.bg(rgb(0xf0f4fc)))
                     .on_click(cx.listener(move |this, _, window, cx| {
                         if this.writing {
                             return;
@@ -676,135 +774,254 @@ impl Render for Messenger {
                         this.selected = Some(id.clone());
                         cx.notify();
                     }))
+                    .child(avatar(&message.from))
                     .child(
                         div()
-                            .flex()
-                            .justify_between()
-                            .gap_2()
+                            .flex_1()
+                            .min_w_0()
+                            .v_flex()
+                            .gap_1()
                             .child(
                                 div()
-                                    .font_semibold()
-                                    .child(format!("{} → {}", message.from, message.to)),
+                                    .flex()
+                                    .gap_2()
+                                    .items_center()
+                                    .child(div().font_semibold().child(message.from.clone()))
+                                    .child(
+                                        crate::muted(format!(
+                                            "→ {} · {}",
+                                            message.to,
+                                            message_time(message)
+                                        ))
+                                        .text_xs(),
+                                    ),
                             )
+                            .child(div().child(preview))
                             .child(
                                 div()
-                                    .text_xs()
-                                    .text_color(status_color(message))
-                                    .child(status_text(message)),
+                                    .flex()
+                                    .gap_2()
+                                    .items_center()
+                                    .child(
+                                        crate::muted(if message.kind == Kind::Queue {
+                                            "Queue"
+                                        } else {
+                                            "Inbox"
+                                        })
+                                        .text_xs(),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(status_color(message))
+                                            .child(status_text(message)),
+                                    )
+                                    .child(div().text_xs().text_color(rgb(0x4169a5)).child(
+                                        if replies > 0 {
+                                            if replies == 1 {
+                                                "1 reply →".into()
+                                            } else {
+                                                format!("{replies} replies →")
+                                            }
+                                        } else {
+                                            "Open thread →".into()
+                                        },
+                                    )),
                             ),
-                    )
-                    .child(div().child(short_body(&message.body)))
-                    .child(
-                        crate::muted(format!(
-                            "{} · {}",
-                            if message.kind == Kind::Queue { "Queue" } else { "Inbox" },
-                            message.id
-                        ))
-                        .text_xs(),
                     ),
             );
         }
         if self.messages.is_empty() {
-            list = list.child(div().py_6().child(crate::muted("No messages in this view.")));
+            timeline = timeline.child(div().p_6().child(crate::muted("No conversations yet.")));
         }
-        flow = flow.child(list).child(
-            div()
-                .flex()
-                .gap_2()
-                .items_center()
-                .child(
-                    Button::new("messages-previous")
-                        .small()
-                        .ghost()
-                        .label("Newer")
-                        .disabled(self.previous.is_empty() || self.loading || self.writing)
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            if let Some(offset) = this.previous.pop() {
-                                this.offset = offset;
-                                this.selected = None;
-                                this.start_load(None, cx);
-                            }
-                        })),
-                )
-                .child(crate::muted(format!("{} messages shown", self.messages.len())).text_xs())
-                .child(
-                    Button::new("messages-next")
-                        .small()
-                        .ghost()
-                        .label("Older")
-                        .disabled(self.next_offset.is_none() || self.loading || self.writing)
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            if let Some(offset) = this.next_offset {
-                                this.previous.push(this.offset);
-                                this.offset = offset;
-                                this.selected = None;
-                                this.start_load(None, cx);
-                            }
-                        })),
-                ),
+        room = room.child(timeline);
+        if self.new_messages > 0 {
+            room = room.child(
+                Button::new("new-messages")
+                    .small()
+                    .label(format!("New messages ↓ · {}", self.new_messages))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.scroll.scroll_to_bottom();
+                        this.new_messages = 0;
+                        cx.notify();
+                    })),
+            );
+        }
+        room = room.child(
+            crate::muted("Select a message to reply in its thread. Viewing does not mark it read.")
+                .text_xs(),
         );
-        if let Some(message) = self.messages.iter().find(|m| Some(&m.id) == self.selected.as_ref())
-        {
-            let mut detail = div()
+        let mut layout = div().flex().flex_1().min_h_0().gap_4();
+        if !narrow || selected.is_none() {
+            layout = layout.child(room);
+        }
+        if let Some(message) = selected {
+            let root = root_id(&all, &message.id);
+            let mut thread = div()
                 .id("message-detail")
                 .v_flex()
                 .gap_3()
-                .p_4()
-                .rounded_lg()
-                .bg(rgb(0xf8fafc))
-                .child(div().font_semibold().child(format!("{} → {}", message.from, message.to)))
-                .child(crate::muted(message.id.clone()).text_xs())
-                .child(div().id("message-body").test_support().child(message.body.clone()));
-            if let Some(id) = &message.reply_to {
-                detail = detail.child(crate::muted(format!("In reply to {id}")).text_xs());
+                .min_h_0()
+                .when(!narrow, |d| {
+                    d.w(px(360.)).flex_shrink_0().pl_4().border_l_1().border_color(rgb(0xe5e7eb))
+                })
+                .when(narrow, |d| d.flex_1())
+                .child(
+                    div()
+                        .flex()
+                        .justify_between()
+                        .items_center()
+                        .child(div().font_semibold().child("Thread"))
+                        .child(
+                            Button::new("close-thread")
+                                .small()
+                                .ghost()
+                                .label("Close")
+                                .disabled(self.writing)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.selected = None;
+                                    this.thread_cache.clear();
+                                    cx.notify();
+                                })),
+                        ),
+                );
+            let mut posts =
+                div().id("thread-posts").flex_1().min_h_0().overflow_y_scroll().v_flex().gap_4();
+            for post in all.iter().filter(|m| root_id(&all, &m.id) == root) {
+                let id = post.id.clone();
+                let mut entry = div()
+                    .v_flex()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .items_center()
+                            .child(avatar(&post.from))
+                            .child(div().font_semibold().child(post.from.clone()))
+                            .child(crate::muted(message_time(post)).text_xs()),
+                    )
+                    .child(crate::muted(format!("To {}", post.to)).text_xs())
+                    .child(
+                        div()
+                            .id(if post.id == root {
+                                SharedString::from("message-body")
+                            } else {
+                                SharedString::from(format!("thread-body-{}", post.id))
+                            })
+                            .test_support()
+                            .child(post.body.clone()),
+                    );
+                if let Some(error) = &post.error {
+                    entry = entry.child(div().text_color(rgb(0xb42318)).child(error.clone()));
+                }
+                if let Some(reply) = &post.reply
+                    && !all.iter().any(|m| m.reply_to.as_ref() == Some(&post.id))
+                {
+                    entry = entry.child(
+                        div()
+                            .pl_3()
+                            .border_l_2()
+                            .border_color(rgb(0xdce6f6))
+                            .v_flex()
+                            .gap_1()
+                            .child(div().font_semibold().child(post.to.clone()))
+                            .child(reply.clone()),
+                    );
+                }
+                if post.reply.is_none() && post.id != message.id {
+                    entry = entry.child(
+                        Button::new(SharedString::from(format!("reply-to-{}", post.id)))
+                            .small()
+                            .ghost()
+                            .label("Reply here")
+                            .disabled(self.writing)
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.selected = Some(id.clone());
+                                this.answer.update(cx, |input, cx| input.set_value("", window, cx));
+                                cx.notify();
+                            })),
+                    );
+                }
+                posts = posts.child(entry);
             }
-            if let Some(error) = &message.error {
-                detail = detail.child(div().text_color(rgb(0xb42318)).child(error.clone()));
+            thread = thread.child(posts);
+            if message.kind == Kind::Inbox && message.status == "pending" {
+                thread = thread.child(
+                    Button::new("message-ack")
+                        .small()
+                        .ghost()
+                        .label("Mark as read")
+                        .disabled(self.loading || self.writing || !self.connected)
+                        .on_click(cx.listener(|this, _, _, cx| this.act(false, cx))),
+                );
             }
-            if let Some(reply) = &message.reply {
-                detail = detail.child(
+            if message.reply.is_none() {
+                thread = thread
+                    .child(
+                        crate::muted(format!("Reply as {} → {}", message.to, message.from))
+                            .text_xs(),
+                    )
+                    .child(
+                        div()
+                            .id("message-answer")
+                            .child(Textarea::new(&self.answer).disabled(self.writing)),
+                    )
+                    .child(
+                        Button::new("message-reply")
+                            .label(if self.writing { "Sending…" } else { "Send reply" })
+                            .disabled(self.loading || self.writing || !self.connected)
+                            .on_click(cx.listener(|this, _, _, cx| this.act(true, cx))),
+                    );
+            }
+            if !self.note.is_empty() {
+                thread = thread.child(crate::muted(self.note.clone()).text_xs());
+            }
+            layout = layout.child(thread);
+        } else if !narrow {
+            let mut people = div()
+                .w(px(180.))
+                .flex_shrink_0()
+                .v_flex()
+                .gap_3()
+                .pl_4()
+                .border_l_1()
+                .border_color(rgb(0xe5e7eb))
+                .child(crate::muted(format!("PARTICIPANTS · {}", self.sessions.len())).text_xs());
+            for session in &self.sessions {
+                let name = session.name.clone();
+                people = people.child(
                     div()
                         .v_flex()
                         .gap_1()
-                        .child(div().font_semibold().child("Reply"))
-                        .child(reply.clone()),
-                );
-            }
-            if self.session.as_ref() == Some(&message.to) {
-                if message.kind == Kind::Inbox && message.status == "pending" {
-                    detail = detail.child(
-                        Button::new("message-ack")
-                            .small()
-                            .ghost()
-                            .label("Mark as read")
-                            .disabled(self.loading || self.writing || !self.connected)
-                            .on_click(cx.listener(|this, _, _, cx| this.act(false, cx))),
-                    );
-                }
-                if message.reply.is_none() {
-                    detail = detail
-                        .child(crate::muted(format!("Reply as {}", message.to)))
                         .child(
-                            div()
-                                .id("message-answer")
-                                .child(Textarea::new(&self.answer).disabled(self.writing)),
+                            Button::new(SharedString::from(format!("session-{name}")))
+                                .small()
+                                .ghost()
+                                .label(name.clone())
+                                .selected(self.session.as_ref() == Some(&name))
+                                .disabled(self.writing)
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.choose_session(Some(name.clone()), window, cx)
+                                })),
                         )
                         .child(
-                            Button::new("message-reply")
-                                .label(if self.writing { "Sending…" } else { "Send reply" })
-                                .disabled(self.loading || self.writing || !self.connected)
-                                .on_click(cx.listener(|this, _, _, cx| this.act(true, cx))),
-                        );
-                }
+                            crate::muted(format!(
+                                "{}{}",
+                                session.provider,
+                                session
+                                    .labels
+                                    .get("role")
+                                    .map(|r| format!(" · {r}"))
+                                    .unwrap_or_default()
+                            ))
+                            .text_xs(),
+                        ),
+                );
             }
-            flow = flow.child(detail);
-        } else {
-            flow = flow.child(crate::muted("Select a message to read the full conversation."));
+            layout = layout.child(people);
         }
-        if !self.note.is_empty() {
-            flow = flow.child(div().text_color(rgb(0x067647)).child(self.note.clone()));
-        }
-        content.child(div().flex().gap_5().child(sessions).child(flow))
+        content.child(layout)
     }
 }
 
@@ -871,6 +1088,91 @@ mod tests {
             assert!(matches!(view.connection, Connection::Local(_)));
             assert_eq!(view.session.as_deref(), Some("local-session"));
         });
+    }
+
+    #[test]
+    fn room_history_deduplicates_shared_deliveries_before_pagination() {
+        let first = snapshot("local").page.messages.remove(0);
+        let mut second = first.clone();
+        second.id = "m2".into();
+        second.sequence = 2;
+        let mut third = first.clone();
+        third.id = "m3".into();
+        third.sequence = 3;
+        let (page, more) = super::recent_messages(
+            vec![first.clone(), second.clone(), third.clone(), first, third],
+            2,
+        );
+        assert_eq!(page.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["m3", "m2"]);
+        assert!(more);
+        let (page, more) = super::recent_messages(vec![second.clone(), second], 2);
+        assert_eq!(page.len(), 1);
+        assert!(!more, "duplicate sender/recipient history is not another page");
+    }
+
+    #[test]
+    fn reply_chains_share_a_root_without_grouping_unrelated_messages() {
+        let mut messages = snapshot("local").page.messages;
+        let mut reply = messages[0].clone();
+        reply.id = "r1".into();
+        reply.reply_to = Some("m1".into());
+        reply.sequence = 2;
+        let mut followup = reply.clone();
+        followup.id = "r2".into();
+        followup.reply_to = Some("r1".into());
+        followup.sequence = 3;
+        let mut unrelated = messages[0].clone();
+        unrelated.id = "other".into();
+        messages.extend([reply, followup, unrelated]);
+        assert_eq!(super::root_id(&messages, "r2"), "m1");
+        assert_eq!(super::root_id(&messages, "other"), "other");
+        assert_eq!(super::root_id(&messages, "missing"), "missing");
+    }
+
+    #[gpui_kit::test]
+    fn live_updates_keep_thread_and_draft_and_narrow_view_returns_to_room(cx: &mut TestAppContext) {
+        use gpui_kit::{px, size};
+        cx.update(gpui_kit::init);
+        let mut entity = None;
+        let handle = cx.add_window(|window, cx| {
+            let view = cx.new(|cx| {
+                let mut view = Messenger::new(window, cx);
+                view.finish_load(0, None, Ok(snapshot("local")));
+                view
+            });
+            entity = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        cx.simulate_window_resize(handle.into(), size(px(1100.), px(800.)));
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.click("message-m1", cx);
+            entity.as_ref().unwrap().update(cx, |view, cx| {
+                view.answer.update(cx, |input, cx| input.set_value("draft stays", window, cx));
+                let mut fresh = snapshot("local");
+                let mut another = fresh.page.messages[0].clone();
+                another.id = "m2".into();
+                another.sequence = 2;
+                fresh.page.messages.push(another);
+                view.finish_load(0, None, Ok(fresh));
+                assert_eq!(view.selected.as_deref(), Some("m1"));
+                assert_eq!(view.answer.read(cx).value().as_str(), "draft stays");
+            });
+            window.render_frame(cx);
+            assert!(window.try_find("message-list").is_some());
+            assert!(window.try_find("message-body").is_some());
+        })
+        .unwrap();
+        cx.simulate_window_resize(handle.into(), size(px(780.), px(800.)));
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("message-list").is_none());
+            assert!(window.try_find("message-body").is_some());
+            window.click("close-thread", cx);
+            assert!(window.try_find("message-list").is_some());
+        })
+        .unwrap();
     }
 
     #[gpui_kit::test]
