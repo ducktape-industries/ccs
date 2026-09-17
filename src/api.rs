@@ -167,6 +167,15 @@ impl Api {
             .with_context(|| format!("GET {url}"))?;
 
         let status = resp.status().as_u16();
+        if status == 429 {
+            let retry_after = resp
+                .headers()
+                .get("retry-after")
+                .and_then(|h| h.to_str().ok())
+                .and_then(|h| h.parse::<u64>().ok())
+                .unwrap_or(600);
+            return Err(crate::usage::RateLimited { retry_after }.into());
+        }
         if status == 401 {
             bail!("token rejected (401); {RELOGIN}");
         }
@@ -232,6 +241,24 @@ mod tests {
             subscription_type: Some("max".into()),
             extra,
         }
+    }
+
+    #[test]
+    fn usage_429_exposes_retry_after_without_retrying() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/usage", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let mut buf = [0; 4096];
+            let read = socket.read(&mut buf).unwrap();
+            assert!(read > 0);
+            socket.write_all(b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 1200\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+        });
+        let error = Api::new().get_json::<UsageResponse>(&url, "fixture-token").unwrap_err();
+        assert_eq!(error.downcast_ref::<crate::usage::RateLimited>().unwrap().retry_after, 1200);
+        server.join().unwrap();
     }
 
     #[test]

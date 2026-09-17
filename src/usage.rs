@@ -11,9 +11,10 @@
 //! renders whatever it finds keeps a newly scoped model from needing a change
 //! here.
 
-use std::fs::{self, Permissions};
+use std::collections::BTreeMap;
+use std::fs::{self, OpenOptions, Permissions};
 use std::io::ErrorKind;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -21,7 +22,7 @@ use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 use crate::fsx::write_atomic;
-use crate::model::UsageResponse;
+use crate::model::{Provider, UsageResponse};
 
 /// Readings sit beside the stash, which is owner-only; what an account has
 /// spent is nobody else's business either.
@@ -38,6 +39,31 @@ pub struct Reading {
     pub usage: UsageResponse,
 }
 
+/// A usage endpoint rate limit, distinct from account quota exhaustion.
+#[derive(Debug)]
+pub struct RateLimited {
+    pub retry_after: u64,
+}
+
+impl std::fmt::Display for RateLimited {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "usage endpoint returned 429; retry after {} seconds", self.retry_after)
+    }
+}
+impl std::error::Error for RateLimited {}
+
+#[derive(Default, Serialize, Deserialize)]
+struct PollState {
+    providers: BTreeMap<Provider, Cooldown>,
+    attempts: BTreeMap<String, i64>,
+}
+
+#[derive(Default, Serialize, Deserialize)]
+struct Cooldown {
+    failures: u32,
+    retry_at: i64,
+}
+
 pub struct Cache {
     dir: PathBuf,
 }
@@ -49,6 +75,71 @@ impl Cache {
         fs::set_permissions(&dir, Permissions::from_mode(DIR_MODE))
             .with_context(|| format!("securing {}", dir.display()))?;
         Ok(Self { dir })
+    }
+
+    /// One shared gate for app, watcher, picker and CLI. Holding an OS lock
+    /// covers read/check/fetch/write; process exit releases it without stale-lock guessing.
+    pub fn poll(
+        &self,
+        slug: &str,
+        provider: Provider,
+        fetch: impl FnOnce() -> Result<UsageResponse>,
+    ) -> Result<UsageResponse> {
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .mode(FILE_MODE)
+            .open(self.dir.join(".poll.lock"))?;
+        lock.lock()?;
+        let now = Timestamp::now().as_second();
+        if let Some(reading) = self.read(slug)?
+            && let Ok(at) = reading.polled_at.parse::<Timestamp>()
+            && (0..300).contains(&(now - at.as_second()))
+        {
+            return Ok(reading.usage);
+        }
+        let path = self.dir.join("poll-state.json");
+        let mut state: PollState = match fs::read(&path) {
+            Ok(raw) => serde_json::from_slice(&raw)?,
+            Err(e) if e.kind() == ErrorKind::NotFound => PollState::default(),
+            Err(e) => return Err(e.into()),
+        };
+        if let Some(cooldown) = state.providers.get(&provider)
+            && cooldown.retry_at > now
+        {
+            anyhow::bail!(
+                "{provider} usage refresh paused after 429; retry in {} seconds",
+                cooldown.retry_at - now
+            );
+        }
+        if state.attempts.get(slug).is_some_and(|at| *at > now) {
+            anyhow::bail!("usage refresh was recently attempted; retry shortly");
+        }
+        state.attempts.insert(slug.into(), now + 60);
+        write_atomic(&path, &serde_json::to_vec(&state)?, FILE_MODE)?;
+        let result = fetch();
+        match &result {
+            Ok(usage) => {
+                self.record(slug, usage)?;
+                state.attempts.remove(slug);
+                state.providers.remove(&provider);
+            }
+            Err(error) => {
+                if let Some(limited) = error.downcast_ref::<RateLimited>() {
+                    let cooldown = state.providers.entry(provider).or_default();
+                    let delay = (600u64 * (1u64 << cooldown.failures.min(3)))
+                        .min(3600)
+                        .max(limited.retry_after)
+                        .min(i64::MAX as u64 / 2);
+                    cooldown.failures = cooldown.failures.saturating_add(1);
+                    cooldown.retry_at = Timestamp::now().as_second().saturating_add(delay as i64);
+                }
+            }
+        }
+        write_atomic(&path, &serde_json::to_vec(&state)?, FILE_MODE)?;
+        result
     }
 
     /// Write down what an account was last seen to have left.
@@ -128,6 +219,103 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
         }
+    }
+
+    #[test]
+    fn repeated_poll_reuses_reading_without_refreshing_its_timestamp() {
+        let f = Fixture::new("reuse-poll");
+        let first = f
+            .cache
+            .poll("a", crate::model::Provider::Claude, || Ok(vec![limit!("session", 7.0)].into()))
+            .unwrap();
+        let stamp = f.read("a").polled_at;
+        let second = Cache::open(&f.root)
+            .unwrap()
+            .poll("a", crate::model::Provider::Claude, || panic!("duplicate request"))
+            .unwrap();
+        assert_eq!(first.limits[0].percent, second.limits[0].percent);
+        assert_eq!(f.read("a").polled_at, stamp);
+    }
+
+    #[test]
+    fn rate_limit_blocks_other_accounts_but_not_other_provider() {
+        let f = Fixture::new("provider-cooldown");
+        let result = f.cache.poll("a", crate::model::Provider::Claude, || {
+            Err(RateLimited { retry_after: 1200 }.into())
+        });
+        assert!(result.is_err());
+        let other = Cache::open(&f.root).unwrap();
+        assert!(
+            other
+                .poll("b", crate::model::Provider::Claude, || panic!("provider still cooling down"))
+                .is_err()
+        );
+        assert!(
+            other.poll("c", crate::model::Provider::Codex, || Ok(UsageResponse::default())).is_ok()
+        );
+        let state: serde_json::Value =
+            serde_json::from_slice(&fs::read(f.root.join("usage/poll-state.json")).unwrap())
+                .unwrap();
+        assert!(
+            state["providers"]["claude"]["retry_at"].as_i64().unwrap()
+                >= Timestamp::now().as_second() + 1199
+        );
+    }
+
+    #[test]
+    fn expired_readings_refresh_and_repeated_429_extends_backoff() {
+        let f = Fixture::new("expired-poll");
+        f.cache.record("a", &UsageResponse::default()).unwrap();
+        let mut reading = f.read("a");
+        reading.polled_at = "2020-01-01T00:00:00Z".into();
+        fs::write(f.cache.at("a"), serde_json::to_vec(&reading).unwrap()).unwrap();
+        assert!(
+            f.cache
+                .poll("a", crate::model::Provider::Claude, || Err(
+                    RateLimited { retry_after: 0 }.into()
+                ))
+                .is_err()
+        );
+        assert_eq!(f.read("a").polled_at, reading.polled_at, "429 preserves last good reading");
+        let path = f.root.join("usage/poll-state.json");
+        let mut state: PollState = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        state.providers.get_mut(&crate::model::Provider::Claude).unwrap().retry_at = 0;
+        state.attempts.clear();
+        fs::write(&path, serde_json::to_vec(&state).unwrap()).unwrap();
+        assert!(
+            f.cache
+                .poll("a", crate::model::Provider::Claude, || Err(
+                    RateLimited { retry_after: 0 }.into()
+                ))
+                .is_err()
+        );
+        let state: PollState = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        let cooldown = &state.providers[&crate::model::Provider::Claude];
+        assert_eq!(cooldown.failures, 2);
+        assert!(cooldown.retry_at >= Timestamp::now().as_second() + 1199);
+    }
+
+    #[test]
+    fn concurrent_cache_handles_only_fetch_once() {
+        let f = Fixture::new("concurrent-poll");
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                let root = &f.root;
+                let calls = &calls;
+                scope.spawn(move || {
+                    Cache::open(root)
+                        .unwrap()
+                        .poll("a", crate::model::Provider::Claude, || {
+                            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            std::thread::sleep(std::time::Duration::from_millis(20));
+                            Ok(UsageResponse::default())
+                        })
+                        .unwrap()
+                });
+            }
+        });
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[test]

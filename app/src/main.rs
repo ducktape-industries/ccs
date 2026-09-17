@@ -221,20 +221,14 @@ impl Dashboard {
         }
         self.busy = true;
         self.refreshing = true;
-        self.models_loading = true;
         self.error.clear();
         self.status = "Refreshing…".into();
         cx.notify();
         cx.spawn(async |this, cx| {
             let accounts = backend::refresh().await;
-            let (claude, codex) = futures::join!(
-                backend::load_models(Provider::Claude),
-                backend::load_models(Provider::Codex),
-            );
             let _ = this.update(cx, |this, cx| {
                 this.busy = false;
                 this.refreshing = false;
-                this.set_models(claude, codex);
                 match accounts {
                     Ok(accounts) => {
                         let failed = accounts.iter().filter(|a| !a.note.is_empty()).count();
