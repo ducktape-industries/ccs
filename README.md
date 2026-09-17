@@ -701,3 +701,100 @@ so rather than letting you wonder.
 ## Licence
 
 MIT. See [LICENSE](LICENSE).
+
+## Session messenger
+
+`ccs server` runs a local messenger independently of `ccs serve` (the account
+API gateway). Start it in a terminal, then register each already-running agent
+session. CCS does not launch agents or assign manager/worker roles.
+
+```sh
+ccs server
+
+# Inside one Claude session:
+export CCS_SESSION=frontend
+ccs session register frontend --claude --label role=manager --label repo=ui
+# Add --bypass only when this Claude session runs in that permission mode.
+
+# Inside one Codex session:
+export CCS_SESSION=backend
+ccs session register backend --codex --label role=manager --label repo=api
+
+ccs sessions --label role=manager
+ccs session label frontend --label repo=web
+# Remove a label with --label repo=
+```
+
+A name belongs to one registered endpoint. Re-registering the same endpoint is
+allowed; a different Claude/Codex session cannot take that name until it is
+explicitly released with `ccs session remove <name>`. Registrations survive
+server restarts and are not automatically expired. Explicitly rebinding a name
+lets the new endpoint inherit that name's mailbox and message history. This prevents duplicate
+registration, not duplicate running agent processes. Labels are arbitrary
+`key=value` metadata, never instructions interpreted by the server.
+
+From the sending session:
+
+```sh
+# Asynchronous: store the question and continue working. Does not wake the receiver.
+ccs inbox send frontend --message 'Can we remove the old field next release?'
+
+# Synchronous: submit to the receiving agent and wait for its explicit reply.
+ccs queue frontend --message 'Which type should this field use?' --timeout 300
+
+# A recipient name can instead be selected by AND-matched labels.
+ccs queue --label role=manager --label repo=web --message 'Which type?'
+```
+
+The recipient reads pending messages (including queue requests) and responds:
+
+```sh
+ccs inbox
+ccs reply m1 --message 'Use a string.'
+ccs inbox ack m2   # asynchronous inbox messages only; queue requires a reply
+ccs message m1    # either participant can inspect status and the saved reply
+```
+
+Every command returns JSON (except server startup and help). Inbox results contain
+`messages` and `next_offset`; use `ccs inbox --limit 20 --offset <next_offset>`
+to continue. After acknowledging messages, restart at offset zero because the
+pending list has changed. Pass `--session <name>` instead of `CCS_SESSION`
+when needed. `ccs session --help` describes the environment-derived default
+names. Merely listing the inbox does not consume messages. An explicit `ack`
+or reply removes a message from the pending list; the record remains available
+by ID. Answers to asynchronous messages arrive in the original sender's inbox with a
+`reply_to` reference. Queue answers return to the waiting caller and remain
+inspectable by ID. Neither answer path pushes another agent turn.
+
+Queue waits for a correlated reply, not just CLI/socket acceptance. It does not
+force an interruption. Its timeout starts when the command is invoked, but an
+in-flight transport submission can take up to 20 seconds. The CLI prints its
+random request ID before contacting the server, so a lost response can still be
+investigated. An unknown ID means the server has not stored that request; if a
+submission is still running, check again before sending another request. Timing out does not cancel or resend the stored request; the CLI prints its
+ID for later inspection. Transport submission is recorded as `submitted`, not
+read or completed. Failed submissions remain inspectable. A server crash during
+submission leaves `dispatching`, meaning delivery is unknown; restart never
+replays it. Inspect the receiver/history before manually resending.
+
+The server uses `~/.ccs/messenger` (override with `CCS_SERVER_DIR`) and a Unix
+socket accessible to the same OS user. It stores sessions and messages in a
+private JSON file using atomic replacement. All local processes running as that
+user are trusted to select identities, edit labels and release registrations;
+session names are not authentication credentials. Peer messages cannot grant
+permissions. This is local communication, not a network service.
+
+No database, automatic retries, process supervisor, or repository hierarchy is
+required. History is retained in full; the initial implementation is intended
+for small local workloads. `ccs sessions` lists registrations, not verified live
+processes. Claude uses the same undocumented peer socket protocol as CCS usage
+notifications; Codex requires a CLI supporting `queue --thread --message`.
+
+Run the isolated integration check with:
+
+```sh
+cargo build -p ccs
+python3 scripts/verify-messenger.py /path/to/target/debug/ccs
+```
+
+The check uses synthetic sessions and transports; it sends nothing to real agents.

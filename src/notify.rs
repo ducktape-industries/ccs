@@ -59,12 +59,84 @@ struct Subscription {
 type Subscribers = BTreeMap<String, Subscription>;
 
 /// A recipient's transport carries only the settings that transport needs.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "provider", rename_all = "snake_case")]
 pub enum Session {
     Claude { socket: String, config: PathBuf, bypass: bool },
     Codex { thread: String, home: PathBuf, binary: PathBuf },
 }
 
 impl Session {
+    /// Validate a messenger endpoint without opening account credentials.
+    pub fn validate(&self) -> Result<()> {
+        match self {
+            Self::Claude { socket, config, .. } => {
+                anyhow::ensure!(
+                    Path::new(socket).is_absolute() && Path::new(socket).exists(),
+                    "Claude messaging socket is missing or not absolute"
+                );
+                anyhow::ensure!(
+                    config.is_absolute() && config.is_dir(),
+                    "Claude config directory is missing"
+                );
+            }
+            Self::Codex { thread, home, binary } => {
+                anyhow::ensure!(
+                    !thread.trim().is_empty() && thread.len() <= 256,
+                    "invalid Codex thread"
+                );
+                anyhow::ensure!(
+                    home.is_absolute() && home.is_dir(),
+                    "Codex home directory is missing"
+                );
+                anyhow::ensure!(
+                    binary.is_absolute() && binary.is_file(),
+                    "Codex executable must be an existing absolute path"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Transport submission only: neither adapter proves that the recipient read the message.
+    pub fn deliver(&self, body: &str) -> Result<()> {
+        match self {
+            Self::Claude { socket, config, bypass } => {
+                let mode = bypass.then_some("bypass");
+                let attest = mode.map(|m| format!(" from-mode=\"{m}\"")).unwrap_or_default();
+                let body = format!(
+                    "<cross-session-message from-name=\"ccs\"{attest}>\n{body}\n</cross-session-message>"
+                );
+                send(&config.join("sessions"), socket, &body, mode)
+                    .context("Claude socket submission failed or could not be confirmed")
+            }
+            Self::Codex { thread, home, binary } => {
+                let mut child = Command::new(binary)
+                    .args(["queue", "--thread", thread, "--message", body])
+                    .env("CODEX_HOME", home)
+                    .current_dir(home)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .context("starting Codex queue")?;
+                let deadline = std::time::Instant::now() + Duration::from_secs(20);
+                loop {
+                    if let Some(status) = child.try_wait()? {
+                        anyhow::ensure!(status.success(), "Codex queue failed ({status})");
+                        return Ok(());
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        bail!("Codex queue timed out; delivery is unknown; do not blindly resend");
+                    }
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+            }
+        }
+    }
+
     pub fn detect(
         config: &Path,
         home: &Path,
@@ -115,7 +187,7 @@ fn calling_provider(socket: Option<&str>, thread: Option<&str>) -> Result<Provid
     }
 }
 
-fn executable(binary: &str) -> Result<PathBuf> {
+pub(crate) fn executable(binary: &str) -> Result<PathBuf> {
     if Path::new(binary).components().count() > 1 {
         return fs::canonicalize(binary).with_context(|| format!("resolving {binary}"));
     }
