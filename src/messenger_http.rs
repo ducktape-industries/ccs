@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 use std::{
     fs::{self, File, OpenOptions},
     io::{BufReader, Read, Write},
-    net::{TcpListener, TcpStream},
+    net::{Shutdown, TcpListener, TcpStream},
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::Path,
     sync::{
@@ -210,6 +210,21 @@ fn respond(stream: &mut TcpStream, status: u16, response: Value) -> Result<()> {
         bytes.len()
     )?;
     stream.write_all(&bytes)?;
+    // Early rejection can leave request bytes in flight. Send FIN, then drain a
+    // bounded amount so closing the socket does not reset the error response.
+    stream.shutdown(Shutdown::Write)?;
+    let deadline = Instant::now() + Duration::from_millis(250);
+    let mut remaining = LIMIT;
+    let mut discard = [0u8; 8192];
+    while remaining > 0 {
+        let Some(timeout) = deadline.checked_duration_since(Instant::now()) else { break };
+        stream.set_read_timeout(Some(timeout))?;
+        let count = remaining.min(discard.len());
+        match stream.read(&mut discard[..count]) {
+            Ok(0) | Err(_) => break,
+            Ok(count) => remaining -= count,
+        }
+    }
     Ok(())
 }
 

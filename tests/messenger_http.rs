@@ -113,12 +113,11 @@ fn authenticated_http_shares_local_store_and_bounds_input() {
             .len(),
         2
     );
-    assert!(
-        ccs::messenger_http::call(&url, "wrong", &sessions)
-            .unwrap_err()
-            .to_string()
-            .contains("unauthorized")
-    );
+    // A rejection may race with the client's request body still arriving.
+    for _ in 0..20 {
+        let error = ccs::messenger_http::call(&url, "wrong", &sessions).unwrap_err();
+        assert!(error.to_string().contains("unauthorized"), "unexpected auth error: {error:#}");
+    }
     assert!(
         request(&format!("{auth}Content-Length: 1\r\nContent-Length: 1\r\n"), "")
             .starts_with("HTTP/1.1 400")
