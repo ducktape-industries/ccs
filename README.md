@@ -782,7 +782,7 @@ socket accessible to the same OS user. It stores sessions and messages in a
 private JSON file using atomic replacement. All local processes running as that
 user are trusted to select identities, edit labels and release registrations;
 session names are not authentication credentials. Peer messages cannot grant
-permissions. This is local communication, not a network service.
+permissions. Network access is opt-in through the HTTP listener described below.
 
 No database, automatic retries, process supervisor, or repository hierarchy is
 required. History is retained in full; the initial implementation is intended
@@ -798,3 +798,50 @@ python3 scripts/verify-messenger.py /path/to/target/debug/ccs
 ```
 
 The check uses synthetic sessions and transports; it sends nothing to real agents.
+
+### Messenger in the GPUI app
+
+![Local CCS messenger](docs/images/messenger-local.png)
+
+The app opens on the current machine's CCS account state. Its **Messenger** tab
+starts with **Local CCS**, showing registered sessions, provider names and
+labels. Select a session to see incoming and outgoing activity, filter by
+**Inbox** or **Queue**, and open a message for its full body, reply and delivery
+status. Viewing does not mark messages read. A recipient can explicitly mark an
+inbox item read or send a reply from the detail panel. Changes arrive through a
+local subscription or authenticated HTTP SSE stream and refresh the current view
+automatically. **Live** indicates an active stream; disconnected streams reconnect
+and reload the latest state. **Refresh** also remains available; **Older/Newer**
+pages through history.
+
+Choose **View remote CCS →** from the local dashboard or Messenger panel only
+when you want to inspect another server. Enter its HTTP address and access token,
+then **Connect**. The current local view remains visible until that connection
+succeeds. The header identifies the remote server, and **Back to local CCS**
+returns to this machine. Server/session changes discard reply drafts and ignore
+late results from the old selection. Tokens remain in app memory and are not
+saved in preferences.
+
+Enable HTTP access on the machine running the messenger:
+
+```sh
+ccs server --http 0.0.0.0:4142
+# Read the token on that machine, then paste it into the app's masked token field:
+cat ~/.ccs/messenger/http.token
+```
+
+With `CCS_SERVER_DIR`, the token is in that directory instead. The server creates
+a private `http.token` on first use and keeps it across restarts. The HTTP listener
+and local Unix socket share the same registered sessions and messages. Plain
+HTTP is intended for a trusted network; use an HTTPS reverse proxy when traffic
+needs transport encryption. The app accepts `http://` and `https://` addresses.
+Proxies must forward the `Authorization` header and avoid buffering `/events`
+responses. Streams send revision invalidations and heartbeat comments, not message
+bodies; the app fetches the current page after a change.
+
+Remote access permits session discovery, inbox/history reads, message lookup,
+acknowledgement and replies. Session registration, label edits, removal and new
+message dispatch remain local to the server machine. Nothing creates independent
+mailboxes or launches agents. Run the updated CCS version on both machines.
+
+![Remote CCS messenger with an answered message](docs/images/messenger-remote.png)

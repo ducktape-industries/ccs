@@ -150,6 +150,23 @@ with tempfile.TemporaryDirectory(prefix='ccs-msg-') as tmp:
         receiver.join(timeout=5); listener.close()
         assert not receiver.is_alive() and not failures, failures
         assert answered['reply'] == 'Claude answer'
+        # UI history includes outgoing queue outcomes, and filters by transport kind.
+        def query(request):
+            with socket.socket(socket.AF_UNIX) as wire:
+                wire.connect(str(root / 'bus/server.sock'))
+                wire.sendall((json.dumps(request) + '\n').encode())
+                with wire.makefile('r') as incoming:
+                    result = json.loads(incoming.readline())
+            assert 'error' not in result, result
+            return result['ok']
+        history = query(dict(op='history', session='alice', kind='queue', limit=100, offset=0))
+        assert any(x['status'] == 'answered' for x in history['messages'])
+        assert any(x['status'] == 'failed' for x in history['messages'])
+        assert all(x['kind'] == 'queue' for x in history['messages'])
+        assert history['messages'][0]['sequence'] > history['messages'][-1]['sequence']
+        sessions = run('sessions')
+        assert next(x for x in sessions if x['name'] == 'carol')['provider'] == 'claude'
+
         run('session', 'remove', 'bob')
         assert run('sessions', '--label', 'repo=web') == []
         assert not (root / 'must-not-exist').exists()

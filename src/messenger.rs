@@ -5,8 +5,8 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail, ensure};
@@ -51,12 +51,14 @@ pub struct Message {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Request {
+    Subscribe,
     Register { session: Registration },
     Label { name: String, labels: Labels },
     Remove { name: String },
     Sessions { labels: Labels },
     Send { id: String, from: String, to: Option<String>, labels: Labels, kind: Kind, body: String },
     Inbox { session: String, limit: usize, offset: usize },
+    History { session: String, kind: Option<Kind>, limit: usize, offset: usize },
     Ack { session: String, id: String },
     Reply { session: String, id: String, body: String },
     Message { session: String, id: String },
@@ -69,11 +71,40 @@ struct State {
     messages: BTreeMap<String, Message>,
 }
 
-struct Store {
+pub(crate) struct Store {
     path: PathBuf,
     state: Mutex<State>,
+    revision: Mutex<u64>,
+    changed: Condvar,
+    subscribers: AtomicUsize,
 }
 impl Store {
+    pub(crate) fn subscribe(&self, mut emit: impl FnMut(Option<u64>) -> Result<()>) -> Result<()> {
+        if self.subscribers.fetch_add(1, Ordering::SeqCst) >= 32 {
+            self.subscribers.fetch_sub(1, Ordering::SeqCst);
+            bail!("too many subscriptions; retry later");
+        }
+        let result = (|| {
+            let mut last = None;
+            loop {
+                let revision =
+                    self.revision.lock().map_err(|_| anyhow::anyhow!("revision lock poisoned"))?;
+                let (revision, _) = self
+                    .changed
+                    .wait_timeout_while(revision, Duration::from_secs(1), |revision| {
+                        Some(*revision) == last
+                    })
+                    .map_err(|_| anyhow::anyhow!("revision lock poisoned"))?;
+                let current = *revision;
+                drop(revision);
+                emit((Some(current) != last).then_some(current))?;
+                last = Some(current);
+            }
+        })();
+        self.subscribers.fetch_sub(1, Ordering::SeqCst);
+        result
+    }
+
     fn transaction<T>(&self, action: impl FnOnce(&mut State) -> Result<T>) -> Result<T> {
         let mut state = self.state.lock().map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
         // ponytail: whole-state snapshots suit a local low-volume mailbox; use SQLite if history grows large.
@@ -81,11 +112,58 @@ impl Store {
         let result = action(&mut next)?;
         fsx::write_atomic(&self.path, &serde_json::to_vec(&next)?, 0o600)?;
         *state = next;
+        let mut revision =
+            self.revision.lock().map_err(|_| anyhow::anyhow!("revision lock poisoned"))?;
+        *revision = revision.wrapping_add(1);
+        self.changed.notify_all();
         Ok(result)
     }
 
-    fn handle(&self, request: Request) -> Result<Value> {
+    fn messages(
+        &self,
+        session: &str,
+        limit: usize,
+        offset: usize,
+        history: bool,
+        kind: Option<Kind>,
+    ) -> Result<Value> {
+        ensure!((1..=100).contains(&limit), "message limit must be 1-100");
+        let s = self.state.lock().map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
+        ensure!(s.sessions.contains_key(session), "session is not registered: {session}");
+        let mut messages: Vec<_> = s
+            .messages
+            .values()
+            .filter(|m| {
+                let participant = m.to == session || (history && m.from == session);
+                participant
+                    && kind.is_none_or(|kind| m.kind == kind)
+                    && (history
+                        || matches!(m.status.as_str(), "pending" | "dispatching" | "submitted"))
+            })
+            .collect();
+        messages.sort_by_key(|m| m.sequence);
+        if history {
+            messages.reverse();
+        }
+        let total = messages.len();
+        let mut page = Vec::new();
+        let mut bytes = 128;
+        for message in messages.into_iter().skip(offset).take(limit) {
+            let value = serde_json::to_value(message)?;
+            let size = serde_json::to_vec(&value)?.len();
+            if bytes + size > LIMIT as usize {
+                break;
+            }
+            bytes += size + 1;
+            page.push(value);
+        }
+        let next = offset.saturating_add(page.len());
+        Ok(json!({"messages":page, "next_offset":(next < total).then_some(next)}))
+    }
+
+    pub(crate) fn handle(&self, request: Request) -> Result<Value> {
         match request {
+            Request::Subscribe => bail!("subscribe requires a streaming connection"),
             Request::Send { id, from, to, labels, kind, body } => {
                 validate_name(&id)?;
                 validate_body(&body)?;
@@ -135,28 +213,10 @@ impl Store {
                 let s = self.state.lock().map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
                 // Don't expose endpoint details to normal discovery clients.
                 Ok(Value::Array(s.sessions.values().filter(|r| matches_labels(r, &labels))
-                    .map(|r| json!({"name": r.name, "labels": r.labels})).collect()))
+                    .map(|r| json!({"name": r.name, "labels": r.labels, "provider": match r.endpoint { Session::Claude { .. } => "claude", Session::Codex { .. } => "codex" }})).collect()))
             }
-            Request::Inbox { session, limit, offset } => {
-                ensure!((1..=100).contains(&limit), "inbox limit must be 1-100");
-                let s = self.state.lock().map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
-                ensure!(s.sessions.contains_key(&session), "session is not registered: {session}");
-                let mut messages: Vec<_> = s.messages.values().filter(|m| m.to == session &&
-                    matches!(m.status.as_str(), "pending" | "dispatching" | "submitted")).collect();
-                messages.sort_by_key(|m| m.sequence);
-                let total = messages.len();
-                let mut page = Vec::new();
-                let mut bytes = 128;
-                for message in messages.into_iter().skip(offset).take(limit) {
-                    let value = serde_json::to_value(message)?;
-                    let size = serde_json::to_vec(&value)?.len();
-                    if bytes + size > LIMIT as usize { break; }
-                    bytes += size + 1;
-                    page.push(value);
-                }
-                let next = offset.saturating_add(page.len());
-                Ok(json!({"messages":page, "next_offset":(next < total).then_some(next)}))
-            }
+            Request::Inbox { session, limit, offset } => self.messages(&session, limit, offset, false, None),
+            Request::History { session, kind, limit, offset } => self.messages(&session, limit, offset, true, kind),
             Request::Message { session, id } => {
                 let s = self.state.lock().map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
                 let m = s.messages.get(&id).context("unknown message")?;
@@ -291,6 +351,10 @@ pub fn call(dir: &Path, request: &Request) -> Result<Value> {
 }
 
 pub fn serve(dir: &Path) -> Result<()> {
+    serve_http(dir, None)
+}
+
+pub fn serve_http(dir: &Path, http: Option<std::net::SocketAddr>) -> Result<()> {
     fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
     ensure!(
         !fs::symlink_metadata(dir)?.file_type().is_symlink(),
@@ -309,7 +373,19 @@ pub fn serve(dir: &Path) -> Result<()> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => State::default(),
         Err(e) => return Err(e.into()),
     };
-    let store = Arc::new(Store { path: state_path, state: Mutex::new(state) });
+    let store = Arc::new(Store {
+        path: state_path,
+        state: Mutex::new(state),
+        revision: Mutex::new(0),
+        changed: Condvar::new(),
+        subscribers: AtomicUsize::new(0),
+    });
+    let http = http
+        .map(|addr| -> Result<_> {
+            let token = crate::messenger_http::token(&dir)?;
+            Ok((std::net::TcpListener::bind(addr)?, token))
+        })
+        .transpose()?;
     let socket = dir.join("server.sock");
     match fs::remove_file(&socket) {
         Ok(()) => {}
@@ -319,6 +395,14 @@ pub fn serve(dir: &Path) -> Result<()> {
     let listener = UnixListener::bind(&socket)?;
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
     eprintln!("CCS messenger listening on {}", socket.display());
+    if let Some((listener, token)) = http {
+        eprintln!(
+            "CCS HTTP listening on {}; token: {}",
+            listener.local_addr()?,
+            dir.join("http.token").display()
+        );
+        crate::messenger_http::listen(listener, token, Arc::clone(&store));
+    }
     let active = Arc::new(AtomicUsize::new(0));
     for connection in listener.incoming() {
         let mut stream = connection?;
@@ -331,9 +415,25 @@ pub fn serve(dir: &Path) -> Result<()> {
         active.fetch_add(1, Ordering::SeqCst);
         let (store, active) = (Arc::clone(&store), Arc::clone(&active));
         std::thread::spawn(move || {
-            let result = read_frame(&mut stream)
-                .and_then(|bytes| Ok(serde_json::from_slice::<Request>(&bytes)?))
-                .and_then(|r| store.handle(r));
+            let request = read_frame(&mut stream)
+                .and_then(|bytes| Ok(serde_json::from_slice::<Request>(&bytes)?));
+            if matches!(request, Ok(Request::Subscribe)) {
+                active.fetch_sub(1, Ordering::SeqCst);
+                let result = store.subscribe(|revision| {
+                    write_frame(
+                        &mut stream,
+                        &match revision {
+                            Some(revision) => json!({"revision":revision}),
+                            None => json!({"heartbeat":true}),
+                        },
+                    )
+                });
+                if let Err(error) = result {
+                    let _ = write_frame(&mut stream, &json!({"error":error.to_string()}));
+                }
+                return;
+            }
+            let result = request.and_then(|request| store.handle(request));
             let response = match result {
                 Ok(value) => json!({"ok":value}),
                 Err(e) => json!({"error":format!("{e:#}")}),
@@ -343,6 +443,65 @@ pub fn serve(dir: &Path) -> Result<()> {
             }
             active.fetch_sub(1, Ordering::SeqCst);
         });
+    }
+    Ok(())
+}
+
+/// Block until cancellation or disconnection, notifying once initially and after store changes.
+pub fn watch(dir: &Path, stop: &AtomicBool, changed: impl FnMut()) -> Result<()> {
+    if stop.load(Ordering::SeqCst) {
+        return Ok(());
+    }
+    let mut stream = UnixStream::connect(dir.join("server.sock"))
+        .context("connect to CCS server; run `ccs server` first")?;
+    stream.set_read_timeout(Some(Duration::from_secs(3)))?;
+    stream.set_write_timeout(Some(IO_TIMEOUT))?;
+    write_frame(&mut stream, &Request::Subscribe)?;
+    watch_events(stream, stop, changed, false)
+}
+
+pub(crate) fn watch_events(
+    reader: impl Read,
+    stop: &AtomicBool,
+    mut changed: impl FnMut(),
+    sse: bool,
+) -> Result<()> {
+    let mut reader = BufReader::new(reader);
+    let mut last = None;
+    while !stop.load(Ordering::SeqCst) {
+        let mut line = Vec::new();
+        loop {
+            let mut byte = [0];
+            let result = reader.read_exact(&mut byte);
+            if stop.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            result.context("reading messenger event stream")?;
+            line.push(byte[0]);
+            ensure!(line.len() <= 4096, "oversized event frame");
+            if byte[0] == b'\n' {
+                break;
+            }
+        }
+        let line = std::str::from_utf8(&line)?.trim();
+        let line = if sse {
+            match line.strip_prefix("data:") {
+                Some(line) => line.trim(),
+                None => continue,
+            }
+        } else {
+            line
+        };
+        let value: Value = serde_json::from_str(line).context("invalid messenger event")?;
+        if let Some(error) = value["error"].as_str() {
+            bail!("{error}");
+        }
+        if let Some(revision) = value["revision"].as_u64()
+            && Some(revision) != last
+        {
+            last = Some(revision);
+            changed();
+        }
     }
     Ok(())
 }

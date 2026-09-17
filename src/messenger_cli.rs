@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 pub const HELP: &str = "\
-ccs server                              run the local messenger in the foreground
+ccs server [--http <ip:port>]           run messenger; optional authenticated HTTP
 ccs session register <name> [--claude|--codex] [--label key=value] [--bypass]
 ccs session label <name> --label key=value  set labels (empty value removes)
 ccs session remove <name>                explicitly release a registered name
@@ -36,6 +36,7 @@ pub fn run(args: &[String]) -> Result<()> {
     let mut timeout = None;
     let (mut limit, mut offset) = (None, None);
     let mut bypass = false;
+    let mut http = None;
     let mut i = 1;
     while i < args.len() {
         let arg = &args[i];
@@ -83,6 +84,16 @@ pub fn run(args: &[String]) -> Result<()> {
                         ensure!(timeout.replace(seconds).is_none(), "duplicate --timeout");
                     }
                 }
+            }
+            "--http" => {
+                ensure!(command == "server", "--http only applies to server");
+                i += 1;
+                let addr = args
+                    .get(i)
+                    .context("--http requires ip:port")?
+                    .parse::<std::net::SocketAddr>()
+                    .context("invalid HTTP listen address")?;
+                ensure!(http.replace(addr).is_none(), "duplicate --http");
             }
             "--claude" | "--codex" => {
                 ensure!(provider.replace(arg.clone()).is_none(), "choose one provider");
@@ -134,7 +145,7 @@ pub fn run(args: &[String]) -> Result<()> {
     let request = match command {
         "server" => {
             ensure!(positionals.is_empty() && identity.is_none(), "usage: ccs server");
-            return messenger::serve(&dir);
+            return messenger::serve_http(&dir, http);
         }
         "sessions" => {
             ensure!(positionals.is_empty(), "usage: ccs sessions [--label key=value]");

@@ -6,6 +6,7 @@ use crate::backend::Account;
 
 /// What the menu bar shows: the active Claude account's session, since that
 /// is the window that runs out within a working day.
+#[cfg(any(target_os = "macos", test))]
 pub fn bar_label(accounts: &[Account]) -> String {
     accounts
         .iter()
