@@ -13,7 +13,7 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::{fsx, notify::Session};
+use crate::{adapters::Session, fsx};
 
 pub type Labels = BTreeMap<String, String>;
 const LIMIT: u64 = 1024 * 1024;
@@ -213,7 +213,7 @@ impl Store {
                 let s = self.state.lock().map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
                 // Don't expose endpoint details to normal discovery clients.
                 Ok(Value::Array(s.sessions.values().filter(|r| matches_labels(r, &labels))
-                    .map(|r| json!({"name": r.name, "labels": r.labels, "provider": match r.endpoint { Session::Claude { .. } => "claude", Session::Codex { .. } => "codex" }})).collect()))
+                    .map(|r| json!({"name": r.name, "labels": r.labels, "provider": r.endpoint.provider()})).collect()))
             }
             Request::Inbox { session, limit, offset } => self.messages(&session, limit, offset, false, None),
             Request::History { session, kind, limit, offset } => self.messages(&session, limit, offset, true, kind),

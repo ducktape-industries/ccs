@@ -1,6 +1,6 @@
 //! Messenger CLI. No account-store initialization or provider-specific calling convention.
+use crate::adapters::Session;
 use crate::messenger::{self, Kind, Labels, Registration, Request};
-use crate::notify::Session;
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::Value;
 use std::io::Read;
@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 pub const HELP: &str = "\
 ccs server [--http <ip:port>]           run messenger; optional authenticated HTTP
-ccs session register <name> [--claude|--codex] [--label key=value] [--bypass]
+ccs session register <name> [--adapter <name>|--claude|--codex] [--label key=value] [--bypass]
 ccs session label <name> --label key=value  set labels (empty value removes)
 ccs session remove <name>                explicitly release a registered name
 ccs sessions [--label key=value]         list registered names; labels are ANDed
@@ -95,8 +95,16 @@ pub fn run(args: &[String]) -> Result<()> {
                     .context("invalid HTTP listen address")?;
                 ensure!(http.replace(addr).is_none(), "duplicate --http");
             }
+            "--adapter" => {
+                i += 1;
+                let name = args.get(i).context("--adapter requires a name")?.clone();
+                ensure!(provider.replace(name).is_none(), "choose one adapter");
+            }
             "--claude" | "--codex" => {
-                ensure!(provider.replace(arg.clone()).is_none(), "choose one provider");
+                ensure!(
+                    provider.replace(arg.trim_start_matches("--").into()).is_none(),
+                    "choose one adapter"
+                );
             }
             "--bypass" => bypass = true,
             _ if arg.starts_with('-') => bail!("unknown messenger option: {arg}"),
@@ -251,16 +259,7 @@ fn endpoint(provider: Option<&str>, bypass: bool) -> Result<Session> {
     let codex =
         std::env::var_os("CODEX_HOME").map(PathBuf::from).unwrap_or_else(|| home.join(".codex"));
     let binary = std::env::var("CCS_CODEX_BINARY").unwrap_or_else(|_| "codex".into());
-    let provider = match provider {
-        Some("--claude") => Some(crate::model::Provider::Claude),
-        Some("--codex") => Some(crate::model::Provider::Codex),
-        _ => None,
-    };
-    let mut session = Session::detect(&config, &codex, &binary, provider, bypass)?;
-    if let Session::Codex { binary: path, .. } = &mut session {
-        *path = crate::notify::executable(&binary)?;
-    }
-    Ok(session)
+    Session::register(provider, &config, &codex, &binary, bypass)
 }
 
 fn new_id() -> Result<String> {

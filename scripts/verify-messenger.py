@@ -41,7 +41,9 @@ with tempfile.TemporaryDirectory(prefix='ccs-msg-') as tmp:
         raise AssertionError('server startup timeout')
     server = start()
     try:
-        run('session', 'register', 'alice', '--codex', '--label', 'role=manager')
+        run('session', 'register', 'alice', '--adapter', 'codex', '--label', 'role=manager')
+        assert 'unknown adapter' in run('session', 'register', 'unknown', '--adapter', 'unimplemented', ok=False)
+        assert 'choose one' in run('session', 'register', 'ambiguous', '--adapter', 'codex', '--claude', ok=False)
         run('session', 'register', 'bob', '--codex', '--label', 'role=manager', '--label', 'repo=ui', session='bob')
         assert len(run('sessions', '--label', 'role=manager')) == 2
         assert run('sessions', '--label', 'repo=ui')[0]['name'] == 'bob'

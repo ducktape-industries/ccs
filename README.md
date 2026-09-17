@@ -799,6 +799,11 @@ python3 scripts/verify-messenger.py /path/to/target/debug/ccs
 
 The check uses synthetic sessions and transports; it sends nothing to real agents.
 
+Session transports implement a shared Rust `Adapter` interface. Use
+`ccs session register <name> --adapter claude` or `--adapter codex`; other agents
+can be added as compiled adapters without changing inbox, queue or the UI.
+See [Adding a compiled session adapter](docs/session-adapters.md).
+
 ### Messenger in the GPUI app
 
 ![Local CCS messenger](docs/images/messenger-local.png)

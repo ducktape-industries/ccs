@@ -111,11 +111,11 @@ fn subscriptions_send_initial_event_and_changes_but_not_reads() {
         session: ccs::messenger::Registration {
             name: "synthetic-session".into(),
             labels: Default::default(),
-            endpoint: ccs::notify::Session::Claude {
+            endpoint: ccs::adapters::Session::Claude(ccs::adapters::ClaudeCode {
                 socket: server.dir.join("server.sock").to_str().unwrap().into(),
                 config: server.dir.clone(),
                 bypass: false,
-            },
+            }),
         },
     };
     ccs::messenger::call(&server.dir, &registration).unwrap();
