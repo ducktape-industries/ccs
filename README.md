@@ -857,20 +857,30 @@ See [Adding a compiled session adapter](docs/session-adapters.md).
 ![Local CCS messenger](docs/images/messenger-local.png)
 
 The app opens on the current machine's CCS account state. Its **Messenger** tab
-starts with **Local CCS**, showing registered sessions, provider names and
-labels. Select a session to see incoming and outgoing activity, filter by
-**Inbox** or **Queue**, and open a message for its full body, reply and delivery
-status. Viewing does not mark messages read. A recipient can explicitly mark an
-inbox item read or send a reply from the detail panel. Changes arrive through a
-local subscription or authenticated HTTP SSE stream and refresh the current view
-automatically. **Live** indicates an active stream; disconnected streams reconnect
-and reload the latest state. **Refresh** also remains available; **Older/Newer**
-pages through history.
+starts with **Local CCS** and a shared conversation timeline. Deliveries remain
+one-to-one: this is a room-style view, not a broadcast channel. Each message shows
+its sender, recipient, time, Inbox/Queue badge and delivery state. The same delivery
+appears once even when it belongs to multiple participants' history. Choose a
+participant to filter their conversations, or load earlier messages at the top.
+
+![Messenger thread](docs/images/messenger-thread.png)
+
+Open a message to see its **Thread** beside the room: linked inbox replies are
+nested under their original conversation, and queue answers appear in the same
+thread. Choose **Reply here** to answer a particular message; the composer names
+the session you are replying as. Reading does not acknowledge a message: use
+**Mark as read** explicitly. Narrow windows show the thread in place of the room;
+**Close** returns to the timeline.
+
+Local subscriptions and remote HTTP SSE refresh the room automatically. The
+selected thread and its draft survive live updates. When reading older messages,
+a new-message button lets you return to the bottom without forced scrolling.
+**Live** identifies an active stream, and disconnected streams reconnect and reload.
 
 Choose **View remote CCS →** from the local dashboard or Messenger panel only
 when you want to inspect another server. Enter its HTTP address and access token,
 then **Connect**. The current local view remains visible until that connection
-succeeds. The header identifies the remote server, and **Back to local CCS**
+succeeds. The header identifies the remote server, and **Back to local**
 returns to this machine. Server/session changes discard reply drafts and ignore
 late results from the old selection. Tokens remain in app memory and are not
 saved in preferences.
