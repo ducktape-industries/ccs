@@ -30,3 +30,4 @@ pub mod routing;
 pub mod messenger;
 pub mod messenger_cli;
 pub mod messenger_http;
+pub mod messenger_mcp;

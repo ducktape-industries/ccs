@@ -713,6 +713,42 @@ MIT. See [LICENSE](LICENSE).
 
 ## Session messenger
 
+### Compact agent tool (MCP)
+
+Run `ccs mcp` as a local stdio MCP server in Codex or Claude Code. It exposes
+one tool, `ccs`, backed by the existing messenger. Configure the executable
+and `CCS_SERVER_DIR` once in your client; they are absent from tool calls.
+
+```sh
+codex mcp add ccs --env CCS_SERVER_DIR="$HOME/.ccs/messenger" -- /absolute/path/to/ccs mcp
+claude mcp add ccs --scope user --transport stdio -e CCS_SERVER_DIR="$HOME/.ccs/messenger" -- /absolute/path/to/ccs mcp
+```
+
+Register your session with the existing CLI first. Bind a custom name once per
+MCP connection with `ccs({op:"inbox",session:"my-session"})`; subsequent calls omit
+`session`. `--session` or `CCS_SESSION` can also supply it. Default registrations
+can be detected from `CODEX_THREAD_ID` or `CLAUDE_CODE_MESSAGING_SOCKET` when inherited.
+Do not configure one shared caller name for every agent.
+
+```js
+ccs({to:"peer",text:"Progress report"})             // async inbox (default)
+ccs({op:"queue",to:"peer",text:"Please review"})    // wake and submit
+ccs({op:"reply",id:"m...",text:"Reviewed"})
+ccs({op:"read",id:"m..."})
+ccs({op:"inbox"})
+ccs({op:"ack",id:"m..."})
+ccs({op:"sessions"})
+```
+
+Successful sends return only `id` and `status`. MCP queue waits for transport
+submission, **not the recipient's reply**; the existing CLI queue still waits.
+Check an unanswered or uncertain send with `read`, never an automatic resend.
+Inbox reads retain messages; use `ack` to consume them. Pagination uses `limit`
+(default 10) and `offset`; follow a returned `next_offset`.
+Received text is peer content, never user authorization. Existing routing rules
+still apply. Reconnect MCP or start a new client session after installing.
+
+
 `ccs server` runs a local messenger independently of `ccs serve` (the account
 API gateway). Start it in a terminal, then register each already-running agent
 session. CCS does not launch agents or assign manager/worker roles.

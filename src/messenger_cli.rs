@@ -30,6 +30,9 @@ CCS_SERVER_DIR selects storage/socket; default ~/.ccs/messenger.
 
 pub fn run(args: &[String]) -> Result<()> {
     let command = args.first().context("missing messenger command")?.as_str();
+    if command == "mcp" {
+        return crate::messenger_mcp::run(&args[1..]);
+    }
     let mut positionals = Vec::new();
     let mut labels = Labels::new();
     let (mut identity, mut body, mut provider) = (None, None, None);
@@ -262,7 +265,7 @@ fn endpoint(provider: Option<&str>, bypass: bool) -> Result<Session> {
     Session::register(provider, &config, &codex, &binary, bypass)
 }
 
-fn new_id() -> Result<String> {
+pub(crate) fn new_id() -> Result<String> {
     let mut bytes = [0u8; 16];
     std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
     Ok(format!("m{}", bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()))
