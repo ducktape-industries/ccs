@@ -88,9 +88,11 @@ with tempfile.TemporaryDirectory(prefix='ccs-msg-') as tmp:
             time.sleep(.03)
         delivered = (root / 'delivered').read_text()
         assert payload in delivered and 'bob-thread' in delivered
-        assert 'CCS_SERVER_DIR=' in delivered
+        assert 'CCS_SERVER_DIR=' not in delivered and 'ccs reply' not in delivered
+        assert 'Reply via' not in delivered and 'Reply using' not in delivered
         pending = run('inbox', session='bob')['messages']
         q = next(x for x in pending if x['kind'] == 'queue')
+        assert f"From: alice\nTo: bob\nMessage-ID: {q['id']}\n" in delivered
         run('inbox', 'ack', q['id'], session='bob', ok=False)
         run('reply', q['id'], '--message', 'string', session='bob')
         stdout, stderr = waiting.communicate(timeout=8)
@@ -141,9 +143,20 @@ with tempfile.TemporaryDirectory(prefix='ccs-msg-') as tmp:
                     assert message['from_mode'] == 'bypass'
                     assert message['priority'] == 'next'
                     text = message['message']['content']
-                    mid = text.split('CCS request ', 1)[1].split()[0]
-                    assert 'CCS_SERVER_DIR=' in text
-                run('reply', mid, '--message', 'Claude answer', session='carol')
+                    mid = text.split('Message-ID: ', 1)[1].splitlines()[0]
+                    assert 'CCS_SERVER_DIR=' not in text and 'ccs reply' not in text
+                    assert 'Reply via' not in text and 'Reply using' not in text
+                reply_args = {'op':'reply', 'id':mid, 'session':'carol', 'text':'Claude answer'}
+                frames = [
+                    {'jsonrpc':'2.0', 'id':1, 'method':'initialize', 'params':{'protocolVersion':'2025-11-25'}},
+                    {'jsonrpc':'2.0', 'id':2, 'method':'tools/call', 'params':{'name':'ccs', 'arguments':reply_args}},
+                ]
+                reply = subprocess.run([binary, 'mcp'], env=claude_env,
+                    input=''.join(json.dumps(frame) + '\n' for frame in frames),
+                    capture_output=True, text=True, timeout=5)
+                assert reply.returncode == 0, reply.stderr
+                result = json.loads(reply.stdout.splitlines()[-1])['result']
+                assert not result['isError'], result
             except BaseException as error:
                 failures.append(error)
         receiver = threading.Thread(target=receive_claude, daemon=True)

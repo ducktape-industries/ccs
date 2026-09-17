@@ -43,6 +43,7 @@ USAGE
                              again as the next pooled account
     ccs serve --key          choose whose gateway key to print
     ccs server               local session messenger (separate from API gateway)
+    ccs mcp                  compact messaging tool over MCP stdio
     ccs session --help       registration, labels, queue, inbox and replies
 
     <account> is a slug, an email, an unambiguous prefix of either, or the
@@ -150,7 +151,7 @@ pub fn parse<I: Iterator<Item = String>>(args: I) -> Result<Cmd> {
     let Some(head) = args.first() else { return Ok(Cmd::Pick) };
 
     match head.as_str() {
-        "server" | "session" | "sessions" | "queue" | "inbox" | "reply" | "message" => {
+        "mcp" | "server" | "session" | "sessions" | "queue" | "inbox" | "reply" | "message" => {
             Ok(Cmd::Messenger { args })
         }
         "-h" | "--help" | "help" => Ok(Cmd::Help),
