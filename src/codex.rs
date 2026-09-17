@@ -448,6 +448,15 @@ impl Client {
             .call()
             .with_context(|| format!("GET {USAGE_URL}"))?;
         let status = resp.status().as_u16();
+        if status == 429 {
+            let retry_after = resp
+                .headers()
+                .get("retry-after")
+                .and_then(|h| h.to_str().ok())
+                .and_then(|h| h.parse::<u64>().ok())
+                .unwrap_or(600);
+            return Err(crate::usage::RateLimited { retry_after }.into());
+        }
         if status == 401 {
             bail!("token rejected (401); {RELOGIN}");
         }

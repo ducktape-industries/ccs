@@ -39,6 +39,15 @@ it is now on, so the model knows its prompt cache just went cold), and — while
 its five-hour window), `session-reset` (an account's window came back, and
 whether its weekly resets sooner than the active one's) and `weekly-reset`.
 Name the kinds you want, or none for all of them; `ccs notify off` stops them.
+Usage polling for saved accounts shares a disk cache and an OS file lock across the CLI, picker,
+watcher and app. Successful readings are reused for five minutes without changing
+their timestamps. Accounts are polled sequentially: a usage HTTP 429 pauses that
+provider's remaining accounts for 10 minutes, doubling on repeated limits up to
+one hour (or longer when an integer `Retry-After` asks for it). The other provider
+can still update. Cooldowns survive process restarts; failed requests retain the
+last good reading. The app's Refresh button updates usage without reloading model
+catalogs. This is usage-endpoint throttling, not an inference-quota reset.
+
 `ccs watch --every 300 --high 90` are the defaults. A session that bypasses
 permission prompts holds a notice for review unless the sender attests the
 same mode: subscribe from such a session with `ccs notify --bypass`.

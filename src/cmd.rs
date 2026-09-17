@@ -131,17 +131,19 @@ struct Probe {
 }
 
 /// Ask one account for its limits, refreshing its access token first if the
-/// token is spent. Network only — persistence is the caller's job.
-fn probe(apis: Apis, entry: &Stashed) -> Probe {
-    let slug = entry.slug.clone();
-    let provider = entry.account.provider;
-    let refreshed = match freshen(apis, provider, &entry.account.oauth) {
-        Ok(refreshed) => refreshed,
-        Err(e) => return Probe { slug, refreshed: None, usage: Err(describe(&e)) },
-    };
-    let oauth = refreshed.as_ref().unwrap_or(&entry.account.oauth);
-    let usage = read_usage(apis, provider, oauth).map_err(|e| describe(&e));
-    Probe { slug, refreshed, usage }
+/// token is spent. Recent readings and rate-limit cooldowns skip the network;
+/// refreshed credentials are still persisted by the caller.
+fn probe(ctx: &Ctx, entry: &Stashed) -> Probe {
+    let mut refreshed = None;
+    let usage = ctx
+        .usage
+        .poll(&entry.slug, entry.account.provider, || {
+            refreshed = freshen(ctx.apis(), entry.account.provider, &entry.account.oauth)?;
+            let oauth = refreshed.as_ref().unwrap_or(&entry.account.oauth);
+            read_usage(ctx.apis(), entry.account.provider, oauth)
+        })
+        .map_err(|e| describe(&e));
+    Probe { slug: entry.slug.clone(), refreshed, usage }
 }
 
 /// What an account has left, asked of its provider.
@@ -155,12 +157,9 @@ fn read_usage(apis: Apis, provider: Provider, oauth: &Oauth) -> Result<UsageResp
     }
 }
 
-fn probe_all(apis: Apis, accounts: &[Stashed]) -> Vec<Probe> {
-    thread::scope(|scope| {
-        let running: Vec<_> =
-            accounts.iter().map(|entry| scope.spawn(move || probe(apis, entry))).collect();
-        running.into_iter().map(|h| h.join().expect("probe thread panicked")).collect()
-    })
+fn probe_all(ctx: &Ctx, accounts: &[Stashed]) -> Vec<Probe> {
+    // Sequential so one provider's 429 stops its remaining accounts immediately.
+    accounts.iter().map(|entry| probe(ctx, entry)).collect()
 }
 
 /// Give back a refreshed credential blob when the current one is spent.
@@ -331,19 +330,6 @@ fn persist(ctx: &Ctx, accounts: &mut [Stashed], probes: &[Probe], live: &Live) -
         let Some(oauth) = &probe.refreshed else { continue };
         let Some(entry) = accounts.iter_mut().find(|a| a.slug == probe.slug) else { continue };
         propagate(ctx, entry, oauth, live)?;
-    }
-    Ok(())
-}
-
-/// Write down what each probe found, so something that cannot afford a poll
-/// can still say where an account stands.
-///
-/// A probe that failed leaves the last good reading alone: to a reader, stale
-/// is worth more than absent, and the stamp on it says how stale.
-fn remember(ctx: &Ctx, probes: &[Probe]) -> Result<()> {
-    for probe in probes {
-        let Ok(usage) = &probe.usage else { continue };
-        ctx.usage.record(&probe.slug, usage)?;
     }
     Ok(())
 }
@@ -632,6 +618,19 @@ fn status_entries(ctx: &Ctx, cached: bool, selected: Option<Provider>) -> Result
             });
             continue;
         }
+        if let Some(account) = account {
+            let mut current = account.clone();
+            current.account.oauth = newest(copies(ctx, account, Some(&held))?).expect("live copy");
+            let result = probe(ctx, &current);
+            if let Some(oauth) = &result.refreshed {
+                let mut live = Live::default();
+                live.set(provider, Some(current.slug.clone()));
+                propagate(ctx, &mut current, oauth, &live)?;
+            }
+            let polled_at = ctx.usage.read(&current.slug)?.map(|r| r.polled_at);
+            readings.push(Cached { entry: entry_of(&current, &result, true), polled_at });
+            continue;
+        }
         let copies = match account {
             Some(account) => copies(ctx, account, Some(&held))?,
             None => vec![held.clone()],
@@ -899,9 +898,8 @@ pub fn switch(ctx: &Ctx, needle: &str, force: bool) -> Result<Switched> {
 
     let live = identify_live(ctx, &accounts)?;
     reconcile(ctx, &mut accounts, &live)?;
-    let probe = probe(ctx.apis(), stash::resolve(&accounts, &slug)?);
+    let probe = probe(ctx, stash::resolve(&accounts, &slug)?);
     persist(ctx, &mut accounts, std::slice::from_ref(&probe), &live)?;
-    remember(ctx, std::slice::from_ref(&probe))?;
 
     // Read after the probe has been folded back in, never before it: the probe
     // may have refreshed this very account, and the copy taken beforehand
@@ -1422,9 +1420,8 @@ fn stashed(ctx: &Ctx) -> Result<Vec<Stashed>> {
 fn survey(ctx: &Ctx, accounts: &mut [Stashed], style: Style) -> Result<(Table, Live)> {
     let live = identify_live(ctx, accounts)?;
     reconcile(ctx, accounts, &live)?;
-    let probes = probe_all(ctx.apis(), accounts);
+    let probes = probe_all(ctx, accounts);
     persist(ctx, accounts, &probes, &live)?;
-    remember(ctx, &probes)?;
 
     let entries = accounts
         .iter()
@@ -2012,41 +2009,13 @@ mod tests {
     }
 
     #[test]
-    fn a_poll_leaves_its_findings_where_something_that_cannot_poll_can_read_them() {
-        let fixture = Fixture::new("recorded");
-        let probe = Probe {
-            slug: "a".into(),
-            refreshed: None,
-            usage: Ok(vec![limit!("weekly_scoped", 61.0, model = "Fable")].into()),
-        };
-        remember(&fixture.ctx(), std::slice::from_ref(&probe)).expect("records");
-
-        let reading = fixture.reading("a").expect("recorded");
-        assert_eq!(reading.usage.limits[0].model_name(), Some("Fable"));
-        assert_eq!(reading.usage.limits[0].percent, 61.0);
-    }
-
-    #[test]
-    fn a_probe_that_failed_leaves_the_last_good_reading_standing() {
-        let fixture = Fixture::new("kept");
-        let good = Probe {
-            slug: "a".into(),
-            refreshed: None,
-            usage: Ok(serde_json::from_value(serde_json::json!({
-                "limits": [{"kind": "session", "percent": 12}],
-                "model_usage": {"gpt-6-astra": {"available": false}}
-            }))
-            .unwrap()),
-        };
-        remember(&fixture.ctx(), std::slice::from_ref(&good)).expect("records");
-
-        let failed =
-            Probe { slug: "a".into(), refreshed: None, usage: Err("token rejected".into()) };
-        remember(&fixture.ctx(), std::slice::from_ref(&failed)).expect("records nothing");
-
-        let reading = fixture.reading("a").expect("still there");
-        assert_eq!(reading.usage.limits[0].percent, 12.0);
-        assert_eq!(reading.usage.model_usage.unwrap()["gpt-6-astra"].available, Some(false));
+    fn cached_usage_does_not_refresh_an_expired_access_token_or_poll_again() {
+        let fixture = Fixture::new("cached-probe");
+        let account = stashed("a", oauth("expired", 0));
+        fixture.usage.record("a", &vec![limit!("session", 12.0)].into()).unwrap();
+        let result = probe(&fixture.ctx(), &account);
+        assert!(result.refreshed.is_none());
+        assert_eq!(result.usage.unwrap().limits[0].percent, 12.0);
     }
 
     /// A reader that cannot afford a poll — a menu bar repainting every few
@@ -2340,6 +2309,9 @@ mod tests {
         fixture.stash.set_active(Provider::Codex, "other").unwrap();
         fixture.codex.write(&codex::AuthFile::default().with(&g.account.oauth)).unwrap();
         fixture.usage.record("g", &vec![limit!("session", 42.0)].into()).unwrap();
+        // An explicit refresh must reuse the shared recent reading too, without OAuth calls.
+        let refreshed = status_entries(&fixture.ctx(), false, Some(Provider::Codex)).unwrap();
+        assert_eq!(refreshed[0].entry.known()[0].percent, 42.0);
         let entries = status_entries(&fixture.ctx(), true, Some(Provider::Codex)).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].entry.slug, "g");
