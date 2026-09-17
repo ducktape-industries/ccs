@@ -1,6 +1,7 @@
 //! Native GPUI Kit dashboard. Network and credential work stays off the UI thread.
 mod backend;
 mod format;
+mod messenger;
 mod platform;
 
 use backend::{Account, Prefs};
@@ -28,9 +29,11 @@ enum Page {
     Accounts,
     Routes,
     Settings,
+    Messenger,
 }
 
 struct Dashboard {
+    messenger: Entity<messenger::Messenger>,
     accounts: Vec<Account>,
     prefs: Prefs,
     routes: Routing,
@@ -71,11 +74,17 @@ impl Dashboard {
             backend::shutdown();
         })
         .detach();
+        let messenger = cx.new(|cx| messenger::Messenger::new(window, cx));
         let mut this = Self {
+            messenger,
             accounts: vec![],
             prefs,
             routes: Routing::default(),
-            page: Page::Accounts,
+            page: if std::env::args().any(|a| a == "--messenger") {
+                Page::Messenger
+            } else {
+                Page::Accounts
+            },
             error: String::new(),
             status: "Loading…".into(),
             gateway_status: "Off".into(),
@@ -188,6 +197,9 @@ impl Dashboard {
                 this.gateway(cx);
             }
         }
+        if this.page == Page::Messenger {
+            this.messenger.update(cx, |view, cx| view.refresh(cx));
+        }
         this
     }
 
@@ -200,6 +212,10 @@ impl Dashboard {
     }
 
     fn refresh(&mut self, cx: &mut Context<Self>) {
+        if self.page == Page::Messenger {
+            self.messenger.update(cx, |view, cx| view.refresh(cx));
+            return;
+        }
         if self.busy || self.models_loading {
             return;
         }
@@ -867,12 +883,16 @@ impl Render for Dashboard {
         for (id, page, label) in [
             ("accounts", Page::Accounts, "Accounts"),
             ("routes", Page::Routes, "Routes"),
+            ("messenger", Page::Messenger, "Messenger"),
             ("settings", Page::Settings, "Settings"),
         ] {
             tabs = tabs.child(
                 Button::new(id).small().ghost().label(label).selected(self.page == page).on_click(
                     cx.listener(move |this, _, _, cx| {
                         this.page = page;
+                        if page == Page::Messenger {
+                            this.messenger.update(cx, |view, cx| view.refresh(cx));
+                        }
                         this.scroll.set_offset(point(px(0.), px(0.)));
                         this.status.clear();
                         cx.notify();
@@ -894,7 +914,7 @@ impl Render for Dashboard {
                     .small()
                     .ghost()
                     .label(if self.refreshing { "Refreshing…" } else { "Refresh" })
-                    .disabled(self.busy || self.models_loading)
+                    .disabled(self.page != Page::Messenger && (self.busy || self.models_loading))
                     .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
             )
             .child(
@@ -904,6 +924,7 @@ impl Render for Dashboard {
             Page::Accounts => self.accounts_page(window, cx).into_any_element(),
             Page::Routes => self.routes_page(cx).into_any_element(),
             Page::Settings => self.settings_page(cx).into_any_element(),
+            Page::Messenger => self.messenger.clone().into_any_element(),
         };
         let mut main = div()
             .v_flex()
@@ -915,7 +936,7 @@ impl Render for Dashboard {
             .text_color(rgb(0x171717))
             .text_sm()
             .child(tabs);
-        if !self.error.is_empty() {
+        if !self.error.is_empty() && self.page != Page::Messenger {
             main = main.child(
                 div()
                     .flex()
@@ -963,8 +984,36 @@ impl Render for Dashboard {
             div()
                 .flex()
                 .justify_between()
-                .child(muted(format::polled_line(&self.accounts)).text_xs())
-                .child(muted(self.status.clone()).text_xs()),
+                .items_center()
+                .child(
+                    muted(if self.page == Page::Messenger {
+                        String::new()
+                    } else {
+                        format!("Local CCS · {}", format::polled_line(&self.accounts))
+                    })
+                    .text_xs(),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(muted(self.status.clone()).text_xs())
+                        .when(self.page != Page::Messenger, |footer| {
+                            footer.child(
+                                Button::new("open-remote-messenger")
+                                    .small()
+                                    .ghost()
+                                    .label("View remote CCS →")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.page = Page::Messenger;
+                                        this.scroll.set_offset(point(px(0.), px(0.)));
+                                        this.messenger.update(cx, |view, cx| view.open_remote(cx));
+                                        cx.notify();
+                                    })),
+                            )
+                        }),
+                ),
         )
     }
 }
@@ -977,7 +1026,7 @@ fn initial_height(accounts: &[Account]) -> f32 {
         .take(8)
         .map(|a| a.limits.len().div_ceil(3).saturating_sub(1))
         .sum();
-    192. + accounts.len().clamp(4, 8) as f32 * 80. + extra_rows as f32 * 64.
+    200. + accounts.len().clamp(4, 8) as f32 * 80. + extra_rows as f32 * 64.
 }
 
 fn main() {

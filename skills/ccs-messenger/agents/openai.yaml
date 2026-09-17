@@ -1,0 +1,4 @@
+interface:
+  display_name: "CCS Messenger"
+  short_description: "Run Claude and Codex conversations through CCS"
+  default_prompt: "Use $ccs-messenger to start Claude Sonnet and Codex Luna sessions and let them exchange two short messages each through the running CCS server."

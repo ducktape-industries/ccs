@@ -2,6 +2,7 @@
 //! process boundary. The binary in `main.rs` is one thin caller; the app is
 //! another, which keeps the gateway and the watcher in its own process.
 
+pub mod adapters;
 pub mod api;
 pub mod cli;
 pub mod cmd;
@@ -25,3 +26,7 @@ pub mod watch;
 pub mod route_picker;
 pub mod routed;
 pub mod routing;
+
+pub mod messenger;
+pub mod messenger_cli;
+pub mod messenger_http;

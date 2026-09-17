@@ -58,11 +58,8 @@ struct Subscription {
 
 type Subscribers = BTreeMap<String, Subscription>;
 
-/// A recipient's transport carries only the settings that transport needs.
-pub enum Session {
-    Claude { socket: String, config: PathBuf, bypass: bool },
-    Codex { thread: String, home: PathBuf, binary: PathBuf },
-}
+pub use crate::adapters::Session;
+use crate::adapters::{ClaudeCode, Codex};
 
 impl Session {
     pub fn detect(
@@ -79,27 +76,8 @@ impl Session {
             None => calling_provider(socket.as_deref(), thread.as_deref())?,
         };
         match provider {
-            Provider::Claude => Ok(Self::Claude {
-                socket: socket.with_context(|| {
-                    format!("{SOCKET_ENV} is not set; run this from inside a Claude Code session")
-                })?,
-                config: fs::canonicalize(config)?,
-                bypass,
-            }),
-            Provider::Codex => {
-                if bypass {
-                    bail!(
-                        "--bypass attests Claude's messaging mode; Codex queue uses the session's own permissions"
-                    );
-                }
-                Ok(Self::Codex {
-                    thread: thread.context(
-                        "CODEX_THREAD_ID is not set; run this from inside a Codex session",
-                    )?,
-                    home: fs::canonicalize(home).context("resolving CODEX_HOME")?,
-                    binary: PathBuf::from(binary),
-                })
-            }
+            Provider::Claude => ClaudeCode::detect(config, bypass).map(Self::Claude),
+            Provider::Codex => Codex::detect(home, binary, bypass).map(Self::Codex),
         }
     }
 }
@@ -115,7 +93,7 @@ fn calling_provider(socket: Option<&str>, thread: Option<&str>) -> Result<Provid
     }
 }
 
-fn executable(binary: &str) -> Result<PathBuf> {
+pub(crate) fn executable(binary: &str) -> Result<PathBuf> {
     if Path::new(binary).components().count() > 1 {
         return fs::canonicalize(binary).with_context(|| format!("resolving {binary}"));
     }
@@ -132,14 +110,13 @@ pub fn subscribe(root: &Path, session: Session, on: bool, kinds: &[String]) -> R
         bail!("unknown notice kind {bad:?}; the kinds are {}", KINDS.join(", "));
     }
     let kinds = if kinds.is_empty() { KINDS.map(String::from).to_vec() } else { kinds.to_vec() };
-    match session {
-        Session::Claude { socket, config, bypass } => {
-            subscribe_claude(root, &socket, &config, bypass, on, kinds)
-        }
-        Session::Codex { thread, home, binary } => {
-            subscribe_codex(root, &thread, &home, &binary, on, kinds)
-        }
+    if let Session::Claude(ClaudeCode { socket, config, bypass }) = session {
+        return subscribe_claude(root, &socket, &config, bypass, on, kinds);
     }
+    if let Session::Codex(Codex { thread, home, binary }) = session {
+        return subscribe_codex(root, &thread, &home, &binary, on, kinds);
+    }
+    bail!("usage notices are not supported for adapter {}", session.provider())
 }
 
 fn subscribe_claude(
@@ -340,7 +317,7 @@ fn token(sessions: &Path, sock: &str) -> Option<String> {
     })
 }
 
-fn send(sessions: &Path, sock: &str, body: &str, mode: Option<&str>) -> Option<()> {
+pub(crate) fn send(sessions: &Path, sock: &str, body: &str, mode: Option<&str>) -> Option<()> {
     let token = token(sessions, sock)?;
     let mut s = UnixStream::connect(sock).ok()?;
     s.set_write_timeout(Some(TIMEOUT)).ok()?;
@@ -393,11 +370,11 @@ mod tests {
         }
 
         fn session(&self) -> Session {
-            Session::Codex {
+            Session::Codex(Codex {
                 thread: "session-uuid".into(),
                 home: self.home.clone(),
                 binary: self.binary.clone(),
-            }
+            })
         }
     }
 
@@ -442,11 +419,11 @@ mod tests {
         subscribe(&f.root, f.session(), true, &["weekly-reset".into()]).unwrap();
         assert_eq!(codex_subscribers(&f.root).unwrap().len(), 1);
         assert_eq!(broadcast(&f.home, &f.root, Provider::Codex, "weekly-reset", "weekly"), 1);
-        let missing_binary = Session::Codex {
+        let missing_binary = Session::Codex(Codex {
             thread: "session-uuid".into(),
             home: f.home.clone(),
             binary: f.root.join("missing-codex"),
-        };
+        });
         subscribe(&f.root, missing_binary, false, &[]).unwrap();
         assert!(codex_subscribers(&f.root).unwrap().is_empty());
     }
@@ -505,11 +482,11 @@ mod tests {
         fs::write(config.join("sessions/123.hash.key"), r#"{"peerToken":"test-token"}"#).unwrap();
         subscribe(
             &f.root,
-            Session::Claude {
+            Session::Claude(ClaudeCode {
                 socket: socket.to_str().unwrap().into(),
                 config: config.clone(),
                 bypass: true,
-            },
+            }),
             true,
             &[],
         )

@@ -42,6 +42,8 @@ USAGE
                              account in use is too limited to answer is sent
                              again as the next pooled account
     ccs serve --key          choose whose gateway key to print
+    ccs server               local session messenger (separate from API gateway)
+    ccs session --help       registration, labels, queue, inbox and replies
 
     <account> is a slug, an email, an unambiguous prefix of either, or the
     index shown by `ccs ls`. Without one, `ccs pin` asks.
@@ -74,6 +76,9 @@ OPTIONS
 
 #[derive(Debug, Clone)]
 pub enum Cmd {
+    Messenger {
+        args: Vec<String>,
+    },
     Claude {
         args: Vec<String>,
     },
@@ -145,6 +150,9 @@ pub fn parse<I: Iterator<Item = String>>(args: I) -> Result<Cmd> {
     let Some(head) = args.first() else { return Ok(Cmd::Pick) };
 
     match head.as_str() {
+        "server" | "session" | "sessions" | "queue" | "inbox" | "reply" | "message" => {
+            Ok(Cmd::Messenger { args })
+        }
         "-h" | "--help" | "help" => Ok(Cmd::Help),
         "-V" | "--version" | "version" => Ok(Cmd::Version),
         "claude" => Ok(Cmd::Claude {

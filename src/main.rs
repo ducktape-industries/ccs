@@ -28,6 +28,10 @@ fn run() -> Result<()> {
         _ => {}
     }
 
+    if let Cmd::Messenger { args } = command {
+        return ccs::messenger_cli::run(&args);
+    }
+
     let env = Env::open()?;
     let ctx = env.ctx();
 
@@ -98,7 +102,9 @@ fn run() -> Result<()> {
             };
             cmd::serve_key(&ctx, provider)
         }
-        Cmd::Help | Cmd::Version => unreachable!("answered before the wiring above"),
+        Cmd::Help | Cmd::Version | Cmd::Messenger { .. } => {
+            unreachable!("answered before the wiring above")
+        }
     }
 }
 
