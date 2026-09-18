@@ -62,6 +62,21 @@ pub fn home_of(config_dir: &Path) -> Option<Home> {
     Some(serde_json::from_slice::<Marker>(&raw).ok()?.home)
 }
 
+/// The account currently installed in a Claude pen, which can change when a
+/// pinned session switches accounts without moving to another directory.
+pub fn account_of(config_dir: &Path) -> Option<String> {
+    let raw = fs::read(config_dir.join(MARKER)).ok()?;
+    Some(serde_json::from_slice::<Marker>(&raw).ok()?.account)
+}
+
+pub fn set_account(config_dir: &Path, account: &str) -> Result<()> {
+    let path = config_dir.join(MARKER);
+    let raw = fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+    let mut marker: Marker = serde_json::from_slice(&raw)?;
+    marker.account = account.to_string();
+    write_atomic(&path, &serde_json::to_vec_pretty(&marker)?, FILE_MODE)
+}
+
 /// Where `slug`'s pen is kept, whether or not one has been built there.
 ///
 /// Answering this without building anything is what lets the credentials a pen
