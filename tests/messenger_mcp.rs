@@ -125,7 +125,8 @@ fn compact_tools_share_cli_store_and_queue_does_not_wait_for_reply() {
     assert!(!error, "{receipt}");
     assert_eq!(receipt["status"], "submitted");
     assert!(start.elapsed() < Duration::from_secs(3));
-    assert_eq!(receipt.as_object().unwrap().len(), 2, "no echoed body or paths");
+    assert_eq!(receipt["receipt"], json!({"stored":true,"delivered":null,"read":false}));
+    assert_eq!(receipt.as_object().unwrap().len(), 3, "no echoed body or paths");
     let id = receipt["id"].as_str().unwrap();
     let mut receiver = Mcp::new(&server.dir, "thread-receiver");
     let envelope = fs::read_to_string(server.dir.join("envelope")).unwrap();
@@ -140,10 +141,15 @@ fn compact_tools_share_cli_store_and_queue_does_not_wait_for_reply() {
     let (error, read) = sender.tool(json!({"op":"read","id":id}));
     assert!(!error);
     assert_eq!(read["reply"], "received");
+    assert_eq!(read["receipt"], json!({"stored":true,"delivered":true,"read":true}));
     let (_, sent) = sender.tool(json!({"to":"receiver","text":"async report"}));
     let (_, inbox) = receiver.tool(json!({"op":"inbox","limit":1}));
     assert_eq!(inbox["messages"][0]["text"], "async report");
     assert_eq!(inbox["messages"][0]["id"], sent["id"]);
+    assert_eq!(
+        inbox["messages"][0]["receipt"],
+        json!({"stored":true,"delivered":false,"read":false})
+    );
     assert!(!receiver.tool(json!({"op":"ack","id":sent["id"]})).0);
     assert!(sender.tool(json!({"op":"reply","id":sent["id"],"text":"not recipient"})).0);
     let mut explicit = Mcp::new(&server.dir, "unregistered-thread");

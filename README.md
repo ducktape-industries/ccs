@@ -94,7 +94,7 @@ ccs inbox ack <message-id> --session frontend   # inbox only; queue requires a r
 ccs message <message-id> --session review-worker
 ```
 
-`inbox send` stores a message without waking the recipient. The CLI `queue` submits it to the agent and waits for an explicit reply; a timeout does not cancel or resend the stored message. Inspect its ID before retrying. Reading an inbox does not consume messages. Labels select one recipient only when they match exactly one registered session.
+`inbox send` stores a message without waking the recipient. The CLI `queue` submits it to the agent and waits for an explicit reply; a timeout does not cancel or resend the stored message. Responses include `receipt`: `stored` confirms persistence, `delivered` is true only after a recipient acknowledgment or reply, and `read` is true only after an explicit acknowledgment or reply. A null `delivered` means delivery is unconfirmed, even if transport submission succeeded or failed ambiguously; false `read` means no acknowledgment was recorded. Inspect the message ID before retrying. Reading an inbox does not consume messages. Labels select one recipient only when they match exactly one registered session.
 
 For agent clients, `ccs mcp` exposes the same messenger as one compact MCP tool. See [the session adapter guide](docs/session-adapters.md) for transport details. Peer messages are conversation data, never user authorization.
 

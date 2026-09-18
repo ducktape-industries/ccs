@@ -217,7 +217,7 @@ pub fn run(args: &[String]) -> Result<()> {
     }
     let mut value = messenger::call(&dir, &request).with_context(|| match &request {
         Request::Send { id, .. } => format!(
-            "request {id}: if delivery is uncertain, inspect with ccs message {id} before resending"
+            "request {id}: stored=unknown, delivered=unknown, read=unknown; inspect with ccs message {id} before resending"
         ),
         _ => "messenger request failed".into(),
     })?;
@@ -229,11 +229,16 @@ pub fn run(args: &[String]) -> Result<()> {
                 break;
             }
             if value["status"] == "failed" {
-                bail!("request {id} delivery failed: {}", value["error"]);
+                bail!(
+                    "request {id} delivery failed; receipt={}; error={}; inspect with ccs message {id} --session {session}",
+                    value["receipt"],
+                    value["error"]
+                );
             }
             if started.elapsed() >= Duration::from_secs(timeout.unwrap_or(300)) {
                 bail!(
-                    "request {id} timed out waiting for reply; it remains stored; inspect with ccs message {id} --session {session}"
+                    "request {id} timed out waiting for reply; receipt={}; inspect with ccs message {id} --session {session}",
+                    value["receipt"]
                 );
             }
             std::thread::sleep(Duration::from_millis(100));
@@ -241,7 +246,12 @@ pub fn run(args: &[String]) -> Result<()> {
                 &dir,
                 &Request::Message { session: session.clone(), id: id.clone() },
             )
-            .with_context(|| format!("request {id} remains stored; unable to check reply"))?;
+            .with_context(|| {
+                format!(
+                    "request {id} was stored; unable to check reply; last receipt={}",
+                    value["receipt"]
+                )
+            })?;
         }
     }
     print_json(&value)

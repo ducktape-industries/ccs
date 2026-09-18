@@ -186,7 +186,7 @@ impl Store {
 
     pub(crate) fn handle(&self, request: Request) -> Result<Value> {
         self.prune_dead_workers()?;
-        match request {
+        let result = match request {
             Request::Subscribe => bail!("subscribe requires a streaming connection"),
             Request::Post { id, to, body } => self.handle(Request::Send {
                 id,
@@ -366,8 +366,35 @@ impl Store {
                 _ => unreachable!(),
                 })
             }
-        }
+        }?;
+        Ok(with_receipt(result))
     }
+}
+
+fn with_receipt(mut value: Value) -> Value {
+    if let Some(messages) = value.get_mut("messages").and_then(Value::as_array_mut) {
+        for message in messages {
+            *message = with_receipt(std::mem::take(message));
+        }
+    } else if let Some(status) = value.get("status").and_then(Value::as_str)
+        && value.get("kind").is_some()
+    {
+        let delivered = match status {
+            "answered" | "read" => Some(true),
+            "pending" => Some(false),
+            "failed"
+                if value["error"]
+                    .as_str()
+                    .is_some_and(|e| e.starts_with("target-endpoint-dead")) =>
+            {
+                Some(false)
+            }
+            _ => None, // Transport submission does not confirm recipient delivery.
+        };
+        let read = matches!(status, "answered" | "read");
+        value["receipt"] = json!({"stored":true,"delivered":delivered,"read":read});
+    }
+    value
 }
 
 fn dead_worker(registration: &Registration) -> bool {

@@ -149,7 +149,7 @@ impl Server {
                 if let Request::Send { id, .. } = &request {
                     // The store may have accepted the request before the connection failed.
                     return Ok(
-                        json!({"id":id,"status":"unknown","error":format!("{error}; read id before resending")}),
+                        json!({"id":id,"status":"unknown","receipt":{"stored":null,"delivered":null,"read":null},"error":format!("{error}; read id before resending")}),
                     );
                 }
                 return Err(error);
@@ -218,7 +218,7 @@ impl Server {
 }
 
 fn compact(value: &Value, body: bool) -> Value {
-    let mut out = json!({"id":value["id"],"status":value["status"]});
+    let mut out = json!({"id":value["id"],"status":value["status"],"receipt":value["receipt"]});
     let fields = if body {
         &["from", "to", "kind", "reply", "reply_to", "error"][..]
     } else {

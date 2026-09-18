@@ -52,11 +52,12 @@ with tempfile.TemporaryDirectory(prefix='ccs-msg-') as tmp:
         assert 'exactly one' in run('inbox', 'send', '--label', 'role=manager', '--message', 'ambiguous', ok=False)
         assert 'exactly one' in run('inbox', 'send', 'missing', '--message', 'missing', ok=False)
         m = run('inbox', 'send', '--label', 'repo=web', '--message', 'review later')
+        assert m['receipt'] == {'stored': True, 'delivered': False, 'read': False}
         assert not (root / 'delivered').exists(), 'inbox must not push'
         assert run('inbox', session='bob')['messages'][0]['id'] == m['id']
         assert run('inbox', session='bob')['messages'][0]['id'] == m['id'], 'read must not consume'
         run('reply', m['id'], '--message', 'wrong recipient', ok=False)
-        run('inbox', 'ack', m['id'], session='bob')
+        assert run('inbox', 'ack', m['id'], session='bob')['receipt'] == {'stored': True, 'delivered': True, 'read': True}
         assert run('inbox', session='bob')['messages'] == []
         question = run('inbox', 'send', 'bob', '--message', 'async question')
         run('reply', question['id'], '--message', 'async answer', session='bob')
@@ -98,12 +99,15 @@ with tempfile.TemporaryDirectory(prefix='ccs-msg-') as tmp:
         stdout, stderr = waiting.communicate(timeout=8)
         assert waiting.returncode == 0, stderr
         assert json.loads(stdout)['reply'] == 'string'
+        assert json.loads(stdout)['receipt'] == {'stored': True, 'delivered': True, 'read': True}
         run('reply', q['id'], '--message', 'overwrite', session='bob', ok=False)
         err = run('queue', 'bob', '--message', 'unanswered', '--timeout', '1', ok=False)
         assert 'timed out' in err and 'message' in err
+        assert '"stored":true' in err and '"delivered":null' in err
         (root / 'reject').touch()
         err = run('queue', 'bob', '--message', 'transport failed', '--timeout', '2', ok=False)
         assert 'failed' in err
+        assert '"stored":true' in err and '"delivered":null' in err and '"read":false' in err
         (root / 'reject').unlink()
         run('session', 'register', 'bob', '--codex', ok=False)  # alice cannot silently rebind bob
         run('session', 'bind', 'bob', '--codex', session='bob-new')
@@ -231,7 +235,10 @@ with tempfile.TemporaryDirectory(prefix='ccs-msg-') as tmp:
         second_socket.unlink()
         failed = run('queue', 'dave', '--message', 'dead socket must fail', '--timeout', '1', ok=False)
         assert 'target-endpoint-dead' in failed
+        assert '"stored":true' in failed and '"delivered":false' in failed
         assert any(m['body'] == 'dead socket must fail' and m['status'] == 'failed'
+                   for m in run('inbox', session='dave')['messages'])
+        assert any(m['body'] == 'dead socket must fail' and m['receipt'] == {'stored': True, 'delivered': False, 'read': False}
                    for m in run('inbox', session='dave')['messages'])
         assert not any(x['name'] == 'carol' for x in run('sessions'))
         assert query(dict(op='message', session='alice', id=answered['id']))['reply'] == 'Claude answer'
