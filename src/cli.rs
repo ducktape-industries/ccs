@@ -20,6 +20,7 @@ USAGE
                              another account without disturbing the one in use
     ccs add --current        choose a provider and stash its current login
     ccs rm <account>         forget a stashed account
+    ccs repair               restore Claude stash slots from UUID-verified pens
     ccs status               choose a provider (or both) and show current usage
     ccs notify [<kind>...]   from inside Claude Code or Codex: have notices
                              delivered into that session's chat. Kinds:
@@ -113,6 +114,7 @@ pub enum Cmd {
     Remove {
         target: String,
     },
+    Repair,
     Status {
         json: bool,
         cached: bool,
@@ -278,6 +280,12 @@ pub fn parse<I: Iterator<Item = String>>(args: I) -> Result<Cmd> {
                 bail!("`ccs rm` needs an account; `ccs ls` lists them");
             };
             Ok(Cmd::Remove { target })
+        }
+        "repair" => {
+            if args.len() != 1 {
+                bail!("usage: ccs repair");
+            }
+            Ok(Cmd::Repair)
         }
         other => bail!("unknown command {other:?}; `ccs --help` lists them"),
     }

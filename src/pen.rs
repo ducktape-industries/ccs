@@ -14,10 +14,11 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::fsx::write_atomic;
+use crate::lock;
 use crate::model::Provider;
 
 const DIR_MODE: u32 = 0o700;
@@ -91,7 +92,18 @@ pub fn prepare(home: &Home, root: &Path, slug: &str) -> Result<PathBuf> {
     fs::create_dir_all(&pen).with_context(|| format!("creating {}", pen.display()))?;
     fs::set_permissions(&pen, Permissions::from_mode(DIR_MODE))
         .with_context(|| format!("securing {}", pen.display()))?;
-
+    let _guard = lock::acquire(&pen)?;
+    if pen.join(MARKER).exists() && account_of(&pen).is_none() {
+        bail!("{} has an unreadable pen marker; refusing to replace it", pen.display());
+    }
+    if let Some(current) = account_of(&pen)
+        && current != slug
+    {
+        bail!(
+            "{} is still assigned to {current}; refusing to reassign a pen used by another session",
+            pen.display()
+        );
+    }
     let marker = Marker { home: home.clone(), account: slug.to_string() };
     let body = serde_json::to_vec_pretty(&marker).context("serialising the pen marker")?;
     write_atomic(&pen.join(MARKER), &body, FILE_MODE)?;
@@ -400,6 +412,16 @@ mod tests {
         let before = names(&pen);
         assert_eq!(fixture.prepare(), pen);
         assert_eq!(names(&pen), before);
+    }
+
+    #[test]
+    fn preparing_a_switched_pen_does_not_steal_the_running_session() {
+        let fixture = Fixture::new("switched-owner");
+        let pen = fixture.prepare();
+        set_account(&pen, "robin").expect("switch pen");
+
+        assert!(prepare(&fixture.home, &fixture.root, "someone_at_example.com").is_err());
+        assert_eq!(account_of(&pen).as_deref(), Some("robin"));
     }
 
     #[test]

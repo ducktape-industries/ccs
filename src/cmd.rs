@@ -5,6 +5,7 @@
 //! command stays testable against substitutes.
 
 use std::io::{self, IsTerminal, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::thread;
 use std::time::Duration;
@@ -222,6 +223,152 @@ fn claude_pens(ctx: &Ctx, slug: &str) -> Result<Vec<PathBuf>> {
     Ok(pens)
 }
 
+/// Resolve a pen from its credentials, never its directory or mutable marker.
+/// A token already in the stash needs no network call; a newly rotated token
+/// needs the profile endpoint to prove which account owns it.
+fn claude_owner(
+    accounts: &[Stashed],
+    oauth: &Oauth,
+    marked: &str,
+    profile_uuid: &impl Fn(&Oauth) -> Result<String>,
+) -> Result<String> {
+    let matches: Vec<_> = accounts
+        .iter()
+        .filter(|entry| {
+            entry.account.provider == Provider::Claude
+                && entry.account.oauth.refresh_token == oauth.refresh_token
+                && entry.account.oauth.access_token == oauth.access_token
+        })
+        .collect();
+    if let [entry] = matches.as_slice()
+        && entry.slug == marked
+    {
+        return Ok(marked.to_string());
+    }
+    let uuid = profile_uuid(oauth)?;
+    claude_owner_uuid(accounts, &uuid)
+}
+
+fn claude_owner_uuid(accounts: &[Stashed], uuid: &str) -> Result<String> {
+    let matches: Vec<_> = accounts
+        .iter()
+        .filter(|entry| entry.account.provider == Provider::Claude && entry.account.uuid == uuid)
+        .collect();
+    match matches.as_slice() {
+        [entry] => Ok(entry.slug.clone()),
+        [] => bail!("Claude pen belongs to an unstashed account UUID {uuid}"),
+        _ => bail!("multiple Claude stash slots name account UUID {uuid}"),
+    }
+}
+
+fn verify_claude_pens(
+    ctx: &Ctx,
+    accounts: &[Stashed],
+    profile_uuid: &impl Fn(&Oauth) -> Result<String>,
+) -> Result<()> {
+    let root = ctx.stash.root().join("pens");
+    if !root.is_dir() {
+        return Ok(());
+    }
+    let mut corrections = Vec::new();
+    for entry in std::fs::read_dir(root)? {
+        let path = entry?.path();
+        let Some(marked) = pen::account_of(&path) else { continue };
+        let Some(file) = ctx.backend.confined(&path).read()? else { continue };
+        let owner = claude_owner(accounts, &file.oauth, &marked, profile_uuid)
+            .with_context(|| format!("verifying Claude pen {}", path.display()))?;
+        if marked != owner {
+            corrections.push((path, owner));
+        }
+    }
+    // Validate the entire set before changing any marker.
+    for (path, owner) in corrections {
+        pen::set_account(&path, &owner)?;
+    }
+    Ok(())
+}
+
+/// Recover a stash slot from the newest pen whose credentials prove the same
+/// Claude UUID. The duplicate-token check is performed on the proposed whole
+/// stash before touching any account file.
+pub fn repair(ctx: &Ctx) -> Result<()> {
+    let repaired =
+        repair_with(ctx, &|oauth| Ok(ctx.api.profile(&oauth.access_token)?.account.uuid))?;
+    if repaired.is_empty() {
+        println!("Claude stash already agrees with its verified pens");
+    } else {
+        println!("restored {} from UUID-verified pens", repaired.join(", "));
+    }
+    Ok(())
+}
+
+fn repair_with(ctx: &Ctx, profile_uuid: &impl Fn(&Oauth) -> Result<String>) -> Result<Vec<String>> {
+    let mut accounts = ctx.stash.list()?;
+    let root = ctx.stash.root().join("pens");
+    let mut candidates: std::collections::HashMap<String, Oauth> = std::collections::HashMap::new();
+    let mut markers = Vec::new();
+    if root.is_dir() {
+        for entry in std::fs::read_dir(root)? {
+            let path = entry?.path();
+            let Some(marked) = pen::account_of(&path) else { continue };
+            let Some(file) = ctx.backend.confined(&path).read()? else { continue };
+            // Repair is deliberately stricter than routine reconciliation:
+            // the stash itself may be corrupt, so matching its token is not
+            // evidence of a pen's owner.
+            let uuid = profile_uuid(&file.oauth)
+                .with_context(|| format!("verifying Claude pen {}", path.display()))?;
+            let owner = claude_owner_uuid(&accounts, &uuid)?;
+            if marked != owner {
+                markers.push((path, owner.clone()));
+            }
+            let candidate = candidates.entry(owner).or_insert_with(|| file.oauth.clone());
+            if file.oauth.expires_at > candidate.expires_at {
+                *candidate = file.oauth;
+            }
+        }
+    }
+    let mut changed = Vec::new();
+    for i in 0..accounts.len() {
+        if accounts[i].account.provider != Provider::Claude {
+            continue;
+        }
+        let duplicate = accounts.iter().enumerate().any(|(j, other)| {
+            i != j
+                && other.account.provider == Provider::Claude
+                && accounts[i].account.uuid != other.account.uuid
+                && accounts[i].account.oauth.refresh_token == other.account.oauth.refresh_token
+        });
+        let Some(candidate) = candidates.get(&accounts[i].slug) else { continue };
+        if (duplicate || candidate.expires_at > accounts[i].account.oauth.expires_at)
+            && candidate.refresh_token != accounts[i].account.oauth.refresh_token
+        {
+            accounts[i].account.oauth = candidate.clone();
+            changed.push(i);
+        }
+    }
+    validate_claude_credentials(&accounts)?;
+    let backup = ctx.stash.root().join("repair-backups");
+    if !changed.is_empty() {
+        std::fs::create_dir_all(&backup)?;
+        std::fs::set_permissions(&backup, std::fs::Permissions::from_mode(0o700))?;
+    }
+    let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos();
+    let mut repaired = Vec::new();
+    for i in changed {
+        let entry = &accounts[i];
+        let old = ctx.stash.root().join("accounts").join(format!("{}.json", entry.slug));
+        let saved = backup.join(format!("{}-{nonce}.json", entry.slug));
+        std::fs::copy(&old, &saved)?;
+        std::fs::set_permissions(&saved, std::fs::Permissions::from_mode(0o600))?;
+        ctx.stash.save(&entry.slug, &entry.account)?;
+        repaired.push(entry.slug.clone());
+    }
+    for (path, owner) in markers {
+        pen::set_account(&path, &owner)?;
+    }
+    Ok(repaired)
+}
+
 /// Pins may have been switched in place, so their credentials' account id,
 /// rather than the directory name, decides which account owns the copy.
 fn codex_copies(ctx: &Ctx, entry: &Stashed) -> Result<Vec<codex::Store>> {
@@ -324,6 +471,19 @@ fn install_codex(store: &dyn codex::Creds, oauth: &Oauth) -> Result<()> {
 /// session refreshing its own credentials leaves every other copy of that
 /// account behind, and nothing says so until one of them is used.
 fn reconcile(ctx: &Ctx, accounts: &mut [Stashed], live: &Live) -> Result<()> {
+    reconcile_with(ctx, accounts, live, &|oauth| {
+        Ok(ctx.api.profile(&oauth.access_token)?.account.uuid)
+    })
+}
+
+fn reconcile_with(
+    ctx: &Ctx,
+    accounts: &mut [Stashed],
+    live: &Live,
+    profile_uuid: &impl Fn(&Oauth) -> Result<String>,
+) -> Result<()> {
+    validate_claude_credentials(accounts)?;
+    verify_claude_pens(ctx, accounts, profile_uuid)?;
     let installed = slots(ctx)?;
     let claude_tokens: Vec<_> = accounts
         .iter()
@@ -1478,7 +1638,7 @@ fn validate_claude_credentials(accounts: &[Stashed]) -> Result<()> {
                 && first.account.oauth.refresh_token == second.account.oauth.refresh_token
             {
                 bail!(
-                    "{} and {} share credentials but name different Claude accounts; repair their logins before polling or switching",
+                    "{} and {} share credentials but name different Claude accounts; run `ccs repair` before polling or switching",
                     first.slug,
                     second.slug
                 );
@@ -1985,7 +2145,8 @@ mod tests {
         fixture.creds.write(&CredsFile::new(oauth("elsewhere", 5))).expect("live credentials");
 
         let mut accounts = vec![stashed("work", oauth("superseded", 1))];
-        reconcile(&fixture.ctx(), &mut accounts, &claude_live("other")).expect("reconcile");
+        reconcile_with(&fixture.ctx(), &mut accounts, &claude_live("other"), &|_| Ok("u".into()))
+            .expect("reconcile");
 
         assert_eq!(accounts[0].account.oauth.refresh_token, "rotated", "the list the caller holds");
         let (stashed, live, _) = fixture.tokens("work");
@@ -1997,7 +2158,8 @@ mod tests {
     fn repinning_a_claude_session_never_assigns_its_new_login_to_the_old_account() {
         let fixture = Fixture::new("claude-repin");
         let hong = stashed("hong", oauth("r-hong", LATER));
-        let robin = stashed("robin", oauth("r-robin", LATER));
+        let mut robin = stashed("robin", oauth("r-robin", LATER));
+        robin.account.uuid = "robin-uuid".into();
         fixture.stash.save("hong", &hong.account).unwrap();
         fixture.stash.save("robin", &robin.account).unwrap();
         fixture.stash.set_active(Provider::Claude, "hong").unwrap();
@@ -2012,7 +2174,7 @@ mod tests {
         let refreshed = oauth("r-robin-new", LATER + 1000);
         pinned_store.write(&CredsFile::new(refreshed)).unwrap();
         let live = identify_live(&fixture.ctx(), &accounts).unwrap();
-        reconcile(&fixture.ctx(), &mut accounts, &live).unwrap();
+        reconcile_with(&fixture.ctx(), &mut accounts, &live, &|_| Ok("robin-uuid".into())).unwrap();
 
         assert_eq!(fixture.tokens("hong").0, "r-hong");
         assert_eq!(fixture.tokens("robin").0, "r-robin-new");
@@ -2038,7 +2200,7 @@ mod tests {
     }
 
     #[test]
-    fn reconciliation_refuses_a_pen_holding_another_claude_account() {
+    fn reconciliation_repairs_a_pen_marker_using_credential_identity() {
         let fixture = Fixture::new("wrong-claude-pen");
         let hong = stashed("hong", oauth("r-hong", LATER));
         let mut robin = stashed("robin", oauth("r-robin", LATER + 1000));
@@ -2048,8 +2210,63 @@ mod tests {
         fixture.pin("hong", &robin.account.oauth);
         let mut accounts = fixture.stash.list().unwrap();
 
-        assert!(reconcile(&fixture.ctx(), &mut accounts, &Live::default()).is_err());
+        reconcile_with(&fixture.ctx(), &mut accounts, &Live::default(), &|_| {
+            Ok("robin-uuid".into())
+        })
+        .unwrap();
         assert_eq!(fixture.tokens("hong").0, "r-hong");
+        assert_eq!(fixture.tokens("robin").0, "r-robin");
+        assert_eq!(
+            pen::account_of(&pen::at(fixture.stash.root(), "hong")).as_deref(),
+            Some("robin")
+        );
+    }
+
+    #[test]
+    fn a_rotated_robin_token_in_hongs_pen_never_replaces_hongs_stash() {
+        let fixture = Fixture::new("rotated-wrong-pen");
+        let hong = stashed("hong", oauth("r-hong", 10));
+        let mut robin = stashed("robin", oauth("r-robin", 10));
+        robin.account.uuid = "robin-uuid".into();
+        fixture.stash.save("hong", &hong.account).unwrap();
+        fixture.stash.save("robin", &robin.account).unwrap();
+        fixture.pin("hong", &oauth("r-robin-rotated", 30));
+        let mut accounts = fixture.stash.list().unwrap();
+
+        reconcile_with(&fixture.ctx(), &mut accounts, &Live::default(), &|_| {
+            Ok("robin-uuid".into())
+        })
+        .unwrap();
+
+        assert_eq!(fixture.tokens("hong").0, "r-hong");
+        assert_eq!(fixture.tokens("robin").0, "r-robin-rotated");
+        assert_eq!(
+            pen::account_of(&pen::at(fixture.stash.root(), "hong")).as_deref(),
+            Some("robin")
+        );
+    }
+
+    #[test]
+    fn repair_restores_a_corrupted_claude_slot_without_a_login() {
+        let fixture = Fixture::new("repair-duplicate");
+        let mut hong = stashed("hong", oauth("r-hong", 30));
+        let mut robin = stashed("robin", oauth("r-robin", 20));
+        robin.account.uuid = "robin-uuid".into();
+        fixture.pin("hong", &hong.account.oauth);
+        fixture.pin("robin", &robin.account.oauth);
+        hong.account.oauth = robin.account.oauth.clone();
+        fixture.stash.save("hong", &hong.account).unwrap();
+        fixture.stash.save("robin", &robin.account).unwrap();
+
+        let repaired = repair_with(&fixture.ctx(), &|oauth| {
+            Ok(if oauth.refresh_token == "r-hong" { "u" } else { "robin-uuid" }.into())
+        })
+        .unwrap();
+
+        assert_eq!(repaired, vec!["hong"]);
+        assert_eq!(fixture.tokens("hong").0, "r-hong");
+        assert_eq!(fixture.tokens("robin").0, "r-robin");
+        assert!(fixture.stash.root().join("repair-backups").read_dir().unwrap().next().is_some());
     }
 
     /// The newest copy goes to the laggards whichever copy it is, so an account
@@ -2060,7 +2277,8 @@ mod tests {
         fixture.pin("work", &oauth("superseded", 1));
 
         let mut accounts = vec![stashed("work", oauth("rotated", 2))];
-        reconcile(&fixture.ctx(), &mut accounts, &claude_live("work")).expect("reconcile");
+        reconcile_with(&fixture.ctx(), &mut accounts, &claude_live("work"), &|_| Ok("u".into()))
+            .expect("reconcile");
 
         let (stashed, live, pen) = fixture.tokens("work");
         assert_eq!(stashed, "rotated", "the stash");

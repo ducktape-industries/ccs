@@ -43,6 +43,7 @@ A pin launches a client with a private credential home. It does not move other s
 | Command | Purpose |
 | --- | --- |
 | `ccs status` | Show current usage; add `--json` or `--cached` for scripts |
+| `ccs repair` | Restore mixed Claude stash credentials from pens verified by account UUID |
 | `ccs routes` | Assign primary and fallback accounts to models |
 | `ccs watch` | Poll usage and send notices; `--rotate` enables account rotation |
 | `ccs notify` | Subscribe the current agent session to switch and usage notices |

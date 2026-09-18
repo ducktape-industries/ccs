@@ -56,6 +56,7 @@ fn run() -> Result<()> {
         }
         Cmd::Pin { provider, target, args } => cmd::pin(&ctx, provider, target.as_deref(), &args),
         Cmd::Remove { target } => cmd::remove(&ctx, &target),
+        Cmd::Repair => cmd::repair(&ctx),
         Cmd::Status { json, cached, provider } => {
             let needs_menu = provider.is_none() && !json && picker::interactive();
             if !needs_menu {
