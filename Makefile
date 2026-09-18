@@ -1,9 +1,9 @@
 # ccs — build, test, install.
 #
-# Installs through cargo rather than copying the binary, so there is one
+# Installs the CLI through cargo rather than copying the binary, so there is one
 # install record and one copy on PATH. PREFIX follows CARGO_HOME by default,
 # which is where `cargo install` would have put it anyway; override it for a
-# system-wide install (`sudo make install PREFIX=/usr/local`).
+# system-wide CLI install (`sudo make install-cli PREFIX=/usr/local`).
 
 PREFIX ?= $(or $(CARGO_HOME),$(HOME)/.cargo)
 BIN := ccs
@@ -17,7 +17,7 @@ APPS ?= /Applications
 BIN_DIR ?= $(HOME)/.local/bin
 UNAME := $(shell uname -s)
 
-.PHONY: all build install uninstall test fmt lint check clean help \
+.PHONY: all build install install-cli uninstall test fmt lint check clean help \
 	app install-app uninstall-app test-app lint-app
 
 all: build
@@ -25,7 +25,9 @@ all: build
 build: ## compile the release binary
 	cargo build --release
 
-install: ## build and put ccs on PATH (PREFIX overrides where)
+install: install-cli install-app ## install both the CLI and app
+
+install-cli: ## build and put ccs on PATH (PREFIX overrides where)
 	cargo install --path . --root '$(PREFIX)' --force
 
 uninstall: ## remove an installed ccs

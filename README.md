@@ -11,10 +11,12 @@ You need a recent Rust toolchain and the Claude Code or Codex CLI you intend to 
 ```sh
 git clone https://github.com/ducktape-industries/ccs.git
 cd ccs
-make install              # installs ccs under ~/.cargo/bin by default
+make install              # installs both the CLI and desktop app
 ```
 
-To build the desktop app, run `make app`. On macOS this creates `build/ccs.app`; on Linux it creates `build/ccs-app` and a desktop entry. `make install-app` installs the app for your platform. Run `make help` for all targets.
+The CLI is installed under `~/.cargo/bin` by default, and the macOS app at `/Applications/ccs.app`. Use `make install-cli` to install only the CLI, or `make install-app` to install only the app. `PREFIX` overrides the CLI installation root; `APPS` overrides the macOS app directory.
+
+To build the desktop app without installing it, run `make app`. On macOS this creates `build/ccs.app`; on Linux it creates `build/ccs-app` and a desktop entry. Run `make help` for all targets.
 
 ## Get started
 
