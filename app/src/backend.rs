@@ -412,6 +412,13 @@ fn prefs_path() -> Result<std::path::PathBuf, Failure> {
     Ok(env()?.ctx().stash.root().join(PREFS_FILE))
 }
 
+pub(crate) fn remote_path() -> Result<std::path::PathBuf, Failure> {
+    #[cfg(test)]
+    return Ok(std::env::temp_dir().join("ccs-app-test-remote-not-saved.enc"));
+    #[cfg(not(test))]
+    return Ok(env()?.ctx().stash.root().join("remote-ccs.enc"));
+}
+
 /// Read the preferences, or the defaults. Missing and broken read the same:
 /// a file this program cannot read is not one it should reason from.
 pub fn read_prefs(path: &std::path::Path) -> Prefs {

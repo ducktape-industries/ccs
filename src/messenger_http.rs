@@ -175,10 +175,12 @@ fn receive(stream: &mut TcpStream, token: &str) -> std::result::Result<Request, 
         request,
         Request::Sessions { .. }
             | Request::History { .. }
+            | Request::RoomHistory { .. }
             | Request::Inbox { .. }
             | Request::Message { .. }
             | Request::Reply { .. }
             | Request::Ack { .. }
+            | Request::Post { .. }
     ) {
         return Err((403, "this operation requires the local Unix socket".into()));
     }

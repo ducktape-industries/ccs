@@ -53,12 +53,15 @@ pub struct Message {
 pub enum Request {
     Subscribe,
     Register { session: Registration },
+    Bind { session: Registration },
     Label { name: String, labels: Labels },
     Remove { name: String },
     Sessions { labels: Labels },
     Send { id: String, from: String, to: Option<String>, labels: Labels, kind: Kind, body: String },
+    Post { id: String, to: String, body: String },
     Inbox { session: String, limit: usize, offset: usize },
     History { session: String, kind: Option<Kind>, limit: usize, offset: usize },
+    RoomHistory { kind: Option<Kind>, limit: usize, offset: usize },
     Ack { session: String, id: String },
     Reply { session: String, id: String, body: String },
     Message { session: String, id: String },
@@ -79,6 +82,20 @@ pub(crate) struct Store {
     subscribers: AtomicUsize,
 }
 impl Store {
+    fn prune_dead_workers(&self) -> Result<()> {
+        let stale = {
+            let state = self.state.lock().map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
+            state.sessions.values().any(dead_worker)
+        };
+        if stale {
+            self.transaction(|state| {
+                state.sessions.retain(|_, session| !dead_worker(session));
+                Ok(())
+            })?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn subscribe(&self, mut emit: impl FnMut(Option<u64>) -> Result<()>) -> Result<()> {
         if self.subscribers.fetch_add(1, Ordering::SeqCst) >= 32 {
             self.subscribers.fetch_sub(1, Ordering::SeqCst);
@@ -121,7 +138,7 @@ impl Store {
 
     fn messages(
         &self,
-        session: &str,
+        session: Option<&str>,
         limit: usize,
         offset: usize,
         history: bool,
@@ -129,16 +146,22 @@ impl Store {
     ) -> Result<Value> {
         ensure!((1..=100).contains(&limit), "message limit must be 1-100");
         let s = self.state.lock().map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
-        ensure!(s.sessions.contains_key(session), "session is not registered: {session}");
+        if let Some(session) = session {
+            ensure!(s.sessions.contains_key(session), "session is not registered: {session}");
+        }
         let mut messages: Vec<_> = s
             .messages
             .values()
             .filter(|m| {
-                let participant = m.to == session || (history && m.from == session);
+                let participant =
+                    session.is_none_or(|session| m.to == session || (history && m.from == session));
                 participant
                     && kind.is_none_or(|kind| m.kind == kind)
                     && (history
-                        || matches!(m.status.as_str(), "pending" | "dispatching" | "submitted"))
+                        || matches!(
+                            m.status.as_str(),
+                            "pending" | "dispatching" | "submitted" | "failed"
+                        ))
             })
             .collect();
         messages.sort_by_key(|m| m.sequence);
@@ -162,29 +185,60 @@ impl Store {
     }
 
     pub(crate) fn handle(&self, request: Request) -> Result<Value> {
+        self.prune_dead_workers()?;
         match request {
             Request::Subscribe => bail!("subscribe requires a streaming connection"),
+            Request::Post { id, to, body } => self.handle(Request::Send {
+                id,
+                from: "ccs-user".into(),
+                to: Some(to),
+                labels: Labels::new(),
+                kind: Kind::Queue,
+                body,
+            }),
             Request::Send { id, from, to, labels, kind, body } => {
                 validate_name(&id)?;
                 validate_body(&body)?;
                 validate_labels(&labels)?;
                 ensure!(to.is_some() == labels.is_empty(), "use a recipient name OR labels");
                 let (message, endpoint) = self.transaction(|s| {
-                    ensure!(!s.messages.contains_key(&id), "message ID already exists; inspect it instead of resending");
-                    ensure!(s.sessions.contains_key(&from), "sender is not registered: {from}");
-                    let matches: Vec<_> = s.sessions.values().filter(|r| {
-                        to.as_ref().map_or_else(|| matches_labels(r, &labels), |name| &r.name == name)
-                    }).collect();
-                    ensure!(matches.len() == 1, "recipient must match exactly one session (found {})", matches.len());
+                    ensure!(
+                        !s.messages.contains_key(&id),
+                        "message ID already exists; inspect it instead of resending"
+                    );
+                    ensure!(
+                        from == "ccs-user" || s.sessions.contains_key(&from),
+                        "sender is not registered: {from}"
+                    );
+                    let matches: Vec<_> = s
+                        .sessions
+                        .values()
+                        .filter(|r| {
+                            to.as_ref()
+                                .map_or_else(|| matches_labels(r, &labels), |name| &r.name == name)
+                        })
+                        .collect();
+                    ensure!(
+                        matches.len() == 1,
+                        "recipient must match exactly one session (found {})",
+                        matches.len()
+                    );
                     let recipient = matches[0];
                     ensure!(recipient.name != from, "cannot send to yourself");
                     let endpoint = recipient.endpoint.clone();
                     s.next_id = s.next_id.checked_add(1).context("message IDs exhausted")?;
                     let message = Message {
-                        id, sequence: s.next_id, from, to: recipient.name.clone(), kind, body,
+                        id,
+                        sequence: s.next_id,
+                        from,
+                        to: recipient.name.clone(),
+                        kind,
+                        body,
                         created_ms: crate::model::now_ms(),
                         status: if kind == Kind::Queue { "dispatching" } else { "pending" }.into(),
-                        reply: None, reply_to: None, error: None,
+                        reply: None,
+                        reply_to: None,
+                        error: None,
                     };
                     s.messages.insert(message.id.clone(), message.clone());
                     Ok((message, endpoint))
@@ -201,38 +255,71 @@ impl Store {
                         if m.reply.is_none() {
                             match result {
                                 Ok(()) => m.status = "submitted".into(),
-                                Err(e) => { m.status = "failed".into(); m.error = Some(e.to_string()); }
+                                Err(e) => {
+                                    m.status = "failed".into();
+                                    m.error = Some(e.to_string());
+                                }
                             }
                         }
                         Ok(serde_json::to_value(m)?)
                     })
-                } else { Ok(serde_json::to_value(message)?) }
+                } else {
+                    Ok(serde_json::to_value(message)?)
+                }
             }
             Request::Sessions { labels } => {
                 validate_labels(&labels)?;
                 let s = self.state.lock().map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
+                let mut activity = BTreeMap::<&str, u64>::new();
+                for message in s.messages.values() {
+                    for name in [&message.from, &message.to] {
+                        let last = activity.entry(name).or_default();
+                        *last = (*last).max(message.sequence);
+                    }
+                }
                 // Don't expose endpoint details to normal discovery clients.
                 Ok(Value::Array(s.sessions.values().filter(|r| matches_labels(r, &labels))
-                    .map(|r| json!({"name": r.name, "labels": r.labels, "provider": r.endpoint.provider()})).collect()))
+                    .map(|r| json!({"name": r.name, "labels": r.labels, "provider": r.endpoint.provider(),
+                        "last_activity": activity.get(r.name.as_str()).copied().unwrap_or(0)})).collect()))
             }
-            Request::Inbox { session, limit, offset } => self.messages(&session, limit, offset, false, None),
-            Request::History { session, kind, limit, offset } => self.messages(&session, limit, offset, true, kind),
+            Request::Inbox { session, limit, offset } => {
+                self.messages(Some(&session), limit, offset, false, None)
+            }
+            Request::History { session, kind, limit, offset } => {
+                self.messages(Some(&session), limit, offset, true, kind)
+            }
+            Request::RoomHistory { kind, limit, offset } => {
+                self.messages(None, limit, offset, true, kind)
+            }
             Request::Message { session, id } => {
                 let s = self.state.lock().map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
                 let m = s.messages.get(&id).context("unknown message")?;
                 ensure!(m.from == session || m.to == session, "session is not a participant");
                 Ok(serde_json::to_value(m)?)
             }
-            other => self.transaction(|s| match other {
-                Request::Register { session } => {
+            other => {
+                let rebinding = matches!(&other, Request::Bind { .. });
+                self.transaction(|s| match other {
+                Request::Register { session } | Request::Bind { session } => {
                     validate_name(&session.name)?;
+                    ensure!(session.name != "ccs-user", "ccs-user is reserved for app messages");
                     validate_labels(&session.labels)?;
                     if let Some(old) = s.sessions.get(&session.name) {
-                        ensure!(serde_json::to_value(&old.endpoint)? == serde_json::to_value(&session.endpoint)?,
-                            "session name already registered to another endpoint; remove it explicitly before rebinding");
+                        if rebinding {
+                            ensure!(same_owner(&old.endpoint, &session.endpoint),
+                                "cannot bind a session name to another provider or account");
+                        } else {
+                            ensure!(serde_json::to_value(&old.endpoint)? == serde_json::to_value(&session.endpoint)?,
+                                "session name already registered to another endpoint; use session bind from the owning session");
+                        }
                     }
                     session.endpoint.validate()?;
                     let name = session.name.clone();
+                    let mut session = session;
+                    if rebinding && session.labels.is_empty()
+                        && let Some(old) = s.sessions.get(&name) {
+                            session.labels = old.labels.clone();
+                    }
                     s.sessions.insert(name.clone(), session);
                     Ok(json!({"name": name}))
                 }
@@ -277,8 +364,22 @@ impl Store {
                     Ok(result)
                 }
                 _ => unreachable!(),
-            }),
+                })
+            }
         }
+    }
+}
+
+fn dead_worker(registration: &Registration) -> bool {
+    registration.labels.get("role").is_some_and(|role| role == "worker")
+        && matches!(&registration.endpoint, Session::Claude(claude) if !Path::new(&claude.socket).exists())
+}
+
+fn same_owner(old: &Session, new: &Session) -> bool {
+    match (old, new) {
+        (Session::Codex(a), Session::Codex(b)) => a.home == b.home,
+        (Session::Claude(a), Session::Claude(b)) => a.config == b.config,
+        _ => false,
     }
 }
 

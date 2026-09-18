@@ -1,6 +1,6 @@
 //! ClaudeCode session transport.
 use super::Adapter;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -28,6 +28,10 @@ impl Adapter for ClaudeCode {
     }
     fn deliver(&self, body: &str) -> Result<()> {
         let Self { socket, config, bypass } = self;
+
+        if !Path::new(socket).exists() {
+            bail!("target-endpoint-dead: Claude messaging socket is gone; wait for session bind");
+        }
 
         let mode = bypass.then_some("bypass");
         let attest = mode.map(|m| format!(" from-mode=\"{m}\"")).unwrap_or_default();

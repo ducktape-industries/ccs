@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 description = "Claude Code and Codex account switcher with subscription usage tracking"
 license = "MIT"
-repository = "https://github.com/orthory/ccs"
+repository = "https://github.com/ducktape-industries/ccs"
 
 [dependencies]
 anyhow = "1"

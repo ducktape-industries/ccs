@@ -113,6 +113,25 @@ fn authenticated_http_shares_local_store_and_bounds_input() {
             .len(),
         2
     );
+    let room = ccs::messenger::Request::RoomHistory { kind: None, limit: 20, offset: 0 };
+    assert!(
+        ccs::messenger_http::call(&url, token.trim(), &room).unwrap()["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|message| message["id"] == "test-inbox")
+    );
+    let post = ccs::messenger::Request::Post {
+        id: "from-app".into(),
+        to: "missing".into(),
+        body: "hello".into(),
+    };
+    assert!(
+        ccs::messenger_http::call(&url, token.trim(), &post)
+            .unwrap_err()
+            .to_string()
+            .contains("recipient must match")
+    );
     // A rejection may race with the client's request body still arriving.
     for _ in 0..20 {
         let error = ccs::messenger_http::call(&url, "wrong", &sessions).unwrap_err();

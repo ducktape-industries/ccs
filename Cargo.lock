@@ -880,6 +880,7 @@ dependencies = [
  "notify-rust",
  "objc2 0.6.4",
  "objc2-app-kit 0.3.2",
+ "ring",
  "serde",
  "serde_json",
  "tray-icon",

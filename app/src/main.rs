@@ -3,6 +3,7 @@ mod backend;
 mod format;
 mod messenger;
 mod platform;
+mod remote_store;
 
 use backend::{Account, Prefs};
 use ccs::model::Provider;
@@ -981,7 +982,7 @@ impl Render for Dashboard {
                 .items_center()
                 .child(
                     muted(if self.page == Page::Messenger {
-                        String::new()
+                        self.messenger.read(cx).footer_line()
                     } else {
                         format!("Local CCS · {}", format::polled_line(&self.accounts))
                     })
@@ -992,7 +993,14 @@ impl Render for Dashboard {
                         .flex()
                         .items_center()
                         .gap_2()
-                        .child(muted(self.status.clone()).text_xs())
+                        .child(
+                            muted(if self.page == Page::Messenger {
+                                self.messenger.read(cx).footer_note()
+                            } else {
+                                self.status.clone()
+                            })
+                            .text_xs(),
+                        )
                         .when(self.page != Page::Messenger, |footer| {
                             footer.child(
                                 Button::new("open-remote-messenger")

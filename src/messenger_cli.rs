@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 pub const HELP: &str = "\
 ccs server [--http <ip:port>]           run messenger; optional authenticated HTTP
 ccs session register <name> [--adapter <name>|--claude|--codex] [--label key=value] [--bypass]
+ccs session bind <name> [--claude|--codex]    refresh your existing endpoint atomically
 ccs session label <name> --label key=value  set labels (empty value removes)
 ccs session remove <name>                explicitly release a registered name
 ccs sessions [--label key=value]         list registered names; labels are ANDed
@@ -116,7 +117,7 @@ pub fn run(args: &[String]) -> Result<()> {
         i += 1;
     }
     let subcommand = positionals.first().map(String::as_str).unwrap_or("");
-    let registration = command == "session" && subcommand == "register";
+    let registration = command == "session" && matches!(subcommand, "register" | "bind");
     let sending = command == "queue" || (command == "inbox" && subcommand == "send");
     ensure!(
         provider.is_none() && !bypass || registration,
@@ -131,7 +132,7 @@ pub fn run(args: &[String]) -> Result<()> {
         labels.is_empty()
             || sending
             || command == "sessions"
-            || (command == "session" && matches!(subcommand, "register" | "label")),
+            || (command == "session" && matches!(subcommand, "register" | "bind" | "label")),
         "--label does not apply to this command"
     );
     ensure!(
@@ -170,9 +171,16 @@ pub fn run(args: &[String]) -> Result<()> {
                     endpoint: endpoint(provider.as_deref(), bypass)?,
                 },
             },
+            "bind" => Request::Bind {
+                session: Registration {
+                    name: one(1)?,
+                    labels,
+                    endpoint: endpoint(provider.as_deref(), bypass)?,
+                },
+            },
             "label" => Request::Label { name: one(1)?, labels },
             "remove" => Request::Remove { name: one(1)? },
-            _ => bail!("usage: ccs session register|label|remove <name>"),
+            _ => bail!("usage: ccs session register|bind|label|remove <name>"),
         },
         "queue" | "inbox" if sending => {
             let offset = usize::from(command == "inbox");

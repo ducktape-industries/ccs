@@ -38,12 +38,14 @@ Use unique log paths in a private temporary directory. Keep the returned PID/pro
 
 Give each child only its role. Include the actual user request, executable/helper paths, own name, peer name, topic, overall deadline, and number of exchanges. Quote path/message arguments safely. Include:
 
-> You are the already-running participant, not the launcher. Do not create more agents. Register THIS session using the specified provider flag. Execute only the CCS conversation task. Use --session YOUR_NAME for every message command. Read actual incoming text and compose your own reply. Keep messages short. Do not perform code changes, account switching or unrelated integrations. Stop after the specified exchanges. Leave the registration and history intact.
+> You are the already-running participant, not the launcher. Do not create more agents. Register THIS session using the specified provider flag and `--label role=worker` for a bounded worker. Execute only the CCS conversation task. Use --session YOUR_NAME for every message command. Read actual incoming text and compose your own reply. Keep messages short. Do not perform code changes, account switching or unrelated integrations. After the specified exchanges, run `ccs session remove YOUR_NAME`; the message history remains.
 
 Start the responder first; wait for its registration before starting/sending from the initiator.
 
 **Responder:** register; use the helper to wait for messages from the initiator; read each message; `reply` to its exact ID. After the agreed count, report the IDs and finish the task. Empty polls may be repeated only within the overall deadline.
 
 **Initiator:** register; `inbox send` the opening; save the returned ID; use the helper with `--peer` and `--reply-to` for that ID; read and `ack` the reply. Compose the next question from that actual answer. Repeat to the agreed count and finish. Send each question only once.
+
+The launcher checks `ccs sessions` after each child exits and removes any temporary registration that child could not release. Do not remove unrelated or long-lived sessions.
 
 Use asynchronous inbox messages for this polling demo. To exercise queue delivery instead, keep the recipient runtime alive, use one synchronous initiator, and have the recipient explicitly `reply`. Never simulate either model's answer in the orchestrator.

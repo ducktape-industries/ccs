@@ -104,9 +104,25 @@ with tempfile.TemporaryDirectory(prefix='ccs-msg-') as tmp:
         (root / 'reject').touch()
         err = run('queue', 'bob', '--message', 'transport failed', '--timeout', '2', ok=False)
         assert 'failed' in err
-        run('session', 'register', 'bob', '--codex', ok=False)  # alice cannot silently rebind bob
-        # A dropped initial connection leaves a recoverable, caller-known ID.
         (root / 'reject').unlink()
+        run('session', 'register', 'bob', '--codex', ok=False)  # alice cannot silently rebind bob
+        run('session', 'bind', 'bob', '--codex', session='bob-new')
+        state = json.loads((root / 'bus/state.json').read_text())
+        assert state['sessions']['bob']['endpoint']['thread'] == 'bob-new-thread'
+        assert state['sessions']['bob']['labels']['repo'] == 'web'
+        bindings = root / 'bindings.json'
+        bindings.write_text(json.dumps({str(root): {'name':'bob','provider':'codex'}}))
+        hook_env = dict(base, CCS_BIN=binary, CCS_BINDINGS_FILE=str(bindings))
+        hook = subprocess.run([sys.executable, str(Path(__file__).with_name('ccs-session-bind.py'))],
+            input=json.dumps({'hook_event_name':'SessionStart','cwd':str(root),'session_id':'hook-thread'}),
+            env=hook_env, text=True, capture_output=True, timeout=10)
+        assert hook.returncode == 0, hook.stderr
+        assert json.loads((root / 'bus/state.json').read_text())['sessions']['bob']['endpoint']['thread'] == 'hook-thread'
+        rebound = run('inbox', 'send', 'bob', '--message', 'after Codex rebind')
+        assert rebound['status'] == 'pending'
+        probe = run('queue', 'bob', '--message', 'Codex rebind works', '--timeout', '1', ok=False)
+        assert 'timed out' in probe and 'hook-thread' in (root / 'delivered').read_text(), (probe, (root / 'delivered').read_text())
+        # A dropped initial connection leaves a recoverable, caller-known ID.
         wire = socket.socket(socket.AF_UNIX)
         wire.connect(str(root / 'bus/server.sock'))
         wire.sendall((json.dumps(dict(op='send', id='lost-response', **{'from': 'alice'}, to='bob', labels={}, kind='queue', body='recover me')) + '\n').encode())
@@ -129,8 +145,27 @@ with tempfile.TemporaryDirectory(prefix='ccs-msg-') as tmp:
         claude_env = dict(env('carol'), CLAUDE_CODE_MESSAGING_SOCKET=str(sockpath), CLAUDE_CONFIG_DIR=str(config))
         registration = subprocess.run([binary, 'session', 'register', 'bob', '--claude'], env=claude_env, capture_output=True)
         assert registration.returncode != 0, 'Claude must not take the existing Codex name'
-        registration = subprocess.run([binary, 'session', 'register', 'carol', '--claude', '--bypass'], env=claude_env, capture_output=True)
+        registration = subprocess.run([binary, 'session', 'bind', 'bob', '--claude'], env=claude_env, capture_output=True)
+        assert registration.returncode != 0, 'binding cannot change a name to another provider'
+        registration = subprocess.run([binary, 'session', 'register', 'carol', '--claude', '--bypass', '--label', 'role=worker'], env=claude_env, capture_output=True)
         assert registration.returncode == 0, registration.stderr
+        second_socket = root / '1000.sock'
+        second_listener = socket.socket(socket.AF_UNIX)
+        second_listener.bind(str(second_socket)); second_listener.listen()
+        (config / 'sessions/1000.test.key').write_text(json.dumps({'peerToken':'fixture-token'}))
+        rebound_env = dict(claude_env, CLAUDE_CODE_MESSAGING_SOCKET=str(second_socket))
+        registration = subprocess.run([binary, 'session', 'bind', 'carol', '--claude', '--bypass'], env=rebound_env, capture_output=True)
+        assert registration.returncode == 0, registration.stderr
+        state = json.loads((root / 'bus/state.json').read_text())
+        assert state['sessions']['carol']['endpoint']['socket'] == str(second_socket)
+        assert state['sessions']['carol']['labels']['role'] == 'worker'
+        bindings.write_text(json.dumps({str(root): {'name':'carol','provider':'claude','bypass':True}}))
+        hook = subprocess.run([sys.executable, str(Path(__file__).with_name('ccs-session-bind.py'))],
+            input=json.dumps({'hook_event_name':'SessionStart','cwd':str(root),'session_id':'carol-session'}),
+            env=dict(rebound_env, CCS_BIN=binary, CCS_BINDINGS_FILE=str(bindings)),
+            text=True, capture_output=True, timeout=10)
+        assert hook.returncode == 0, hook.stderr
+        listener.close(); listener = second_listener
         failures = []
         def receive_claude():
             try:
@@ -179,8 +214,27 @@ with tempfile.TemporaryDirectory(prefix='ccs-msg-') as tmp:
         assert any(x['status'] == 'failed' for x in history['messages'])
         assert all(x['kind'] == 'queue' for x in history['messages'])
         assert history['messages'][0]['sequence'] > history['messages'][-1]['sequence']
+        room = query(dict(op='room_history', kind=None, limit=100, offset=0))
+        assert any(x['id'] == literal['id'] for x in room['messages'])
+        assert len({x['id'] for x in room['messages']}) == len(room['messages'])
+        assert room['messages'][0]['sequence'] > room['messages'][-1]['sequence']
+        user_message = query(dict(op='post', id='user-to-bob', to='bob', body='Please review this'))
+        assert user_message['from'] == 'ccs-user' and user_message['status'] == 'submitted'
+        assert 'Please review this' in (root / 'delivered').read_text()
+        assert query(dict(op='message', session='ccs-user', id='user-to-bob'))['id'] == 'user-to-bob'
         sessions = run('sessions')
         assert next(x for x in sessions if x['name'] == 'carol')['provider'] == 'claude'
+        assert next(x for x in sessions if x['name'] == 'bob')['last_activity'] > 0
+        registration = subprocess.run([binary, 'session', 'register', 'dave', '--claude', '--label', 'role=manager'],
+            env=rebound_env, capture_output=True)
+        assert registration.returncode == 0, registration.stderr
+        second_socket.unlink()
+        failed = run('queue', 'dave', '--message', 'dead socket must fail', '--timeout', '1', ok=False)
+        assert 'target-endpoint-dead' in failed
+        assert any(m['body'] == 'dead socket must fail' and m['status'] == 'failed'
+                   for m in run('inbox', session='dave')['messages'])
+        assert not any(x['name'] == 'carol' for x in run('sessions'))
+        assert query(dict(op='message', session='alice', id=answered['id']))['reply'] == 'Claude answer'
 
         run('session', 'remove', 'bob')
         assert run('sessions', '--label', 'repo=web') == []

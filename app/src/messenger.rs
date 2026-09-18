@@ -1,6 +1,6 @@
 //! Session-based inbox/queue viewer. Local first; remote is an explicit connection.
 use futures::{SinkExt, StreamExt};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{
     Arc,
@@ -8,6 +8,7 @@ use std::sync::{
 };
 use std::time::Duration;
 
+use crate::{backend, remote_store};
 use ccs::messenger::{self, Kind, Labels, Message, Request};
 use gpui_kit::base::TestSupportExt;
 use gpui_kit::component::{
@@ -64,6 +65,8 @@ struct SessionRow {
     name: String,
     provider: String,
     labels: Labels,
+    #[serde(default)]
+    last_activity: u64,
 }
 #[derive(Default, Deserialize)]
 struct MessagePage {
@@ -85,6 +88,33 @@ fn recent_messages(messages: Vec<Message>, count: usize) -> (Vec<Message>, bool)
     (messages, more)
 }
 
+fn visible_sessions<'a>(
+    sessions: &'a [SessionRow],
+    query: &str,
+    show_workers: bool,
+    recent_first: bool,
+) -> Vec<&'a SessionRow> {
+    let query = query.trim().to_lowercase();
+    let mut rows: Vec<_> = sessions
+        .iter()
+        .filter(|row| {
+            (show_workers || row.labels.get("role").is_none_or(|role| role != "worker"))
+                && (query.is_empty()
+                    || row.name.to_lowercase().contains(&query)
+                    || row.provider.to_lowercase().contains(&query)
+                    || row.labels.values().any(|value| value.to_lowercase().contains(&query)))
+        })
+        .collect();
+    if recent_first {
+        rows.sort_by(|a, b| {
+            b.last_activity.cmp(&a.last_activity).then_with(|| a.name.cmp(&b.name))
+        });
+    } else {
+        rows.sort_by(|a, b| a.name.cmp(&b.name));
+    }
+    rows
+}
+
 fn load(
     connection: &Connection,
     selected: Option<String>,
@@ -98,23 +128,28 @@ fn load(
         let session = selected.filter(|name| sessions.iter().any(|s| &s.name == name));
         let count = offset + 20;
         let mut merged = Vec::new();
-        for row in sessions.iter().filter(|s| session.as_ref().is_none_or(|n| n == &s.name)) {
-            let mut cursor = 0;
-            while cursor <= count {
-                let page: MessagePage =
-                    serde_json::from_value(connection.call(&Request::History {
-                        session: row.name.clone(),
-                        kind,
-                        limit: (count + 1 - cursor).min(100),
-                        offset: cursor,
-                    })?)?;
-                merged.extend(page.messages);
-                let Some(next) = page.next_offset else { break };
-                if next <= cursor {
-                    break;
-                }
-                cursor = next;
+        let mut cursor = 0;
+        while cursor <= count {
+            let request = match &session {
+                Some(name) => Request::History {
+                    session: name.clone(),
+                    kind,
+                    limit: (count + 1 - cursor).min(100),
+                    offset: cursor,
+                },
+                None => Request::RoomHistory {
+                    kind,
+                    limit: (count + 1 - cursor).min(100),
+                    offset: cursor,
+                },
+            };
+            let page: MessagePage = serde_json::from_value(connection.call(&request)?)?;
+            merged.extend(page.messages);
+            let Some(next) = page.next_offset else { break };
+            if next <= cursor {
+                break;
             }
+            cursor = next;
         }
         let (mut messages, more) = recent_messages(merged, count);
         let next_offset = more.then_some(offset + 20);
@@ -170,15 +205,48 @@ pub struct Messenger {
     loading: bool,
     writing: bool,
     remote_form: bool,
+    remote_saved: bool,
+    new_remote: bool,
+    unlocking: bool,
+    save_password: Option<String>,
+    reset_password: bool,
     reset_answer: bool,
+    reset_compose: bool,
     error: String,
     note: String,
     url: Entity<InputState>,
     token: Entity<InputState>,
+    password: Entity<InputState>,
     answer: Entity<TextareaState>,
+    compose: Entity<TextareaState>,
+    participant_query: Entity<InputState>,
+    show_workers: bool,
+    recent_first: bool,
+    participant_width: f32,
+    thread_width: f32,
 }
 
 impl Messenger {
+    pub fn footer_line(&self) -> String {
+        let state = if self.connected { "Connected" } else { "Offline" };
+        let current = self.session.as_deref().unwrap_or("All conversations");
+        format!(
+            "{} · {state} · {} participants · {current}",
+            self.connection.title(),
+            self.sessions.len()
+        )
+    }
+
+    pub fn footer_note(&self) -> String {
+        if self.loading {
+            "Updating conversations…".into()
+        } else if !self.error.is_empty() {
+            "Messenger needs attention".into()
+        } else {
+            self.note.clone()
+        }
+    }
+
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         Self {
             connection: Connection::local(),
@@ -203,16 +271,38 @@ impl Messenger {
             loading: false,
             writing: false,
             remote_form: false,
+            remote_saved: backend::remote_path().is_ok_and(|path| path.exists()),
+            new_remote: false,
+            unlocking: false,
+            save_password: None,
+            reset_password: false,
             reset_answer: false,
+            reset_compose: false,
             error: String::new(),
             note: String::new(),
             url: cx.new(|cx| InputState::new(window, cx).placeholder("http://server:4142")),
             token: cx.new(|cx| {
                 InputState::new(window, cx).placeholder("Server access token").masked(true)
             }),
+            password: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("Encryption password (8+ characters)")
+                    .masked(true)
+            }),
             answer: cx.new(|cx| {
                 TextareaState::new(window, cx).placeholder("Write a reply…").auto_grow(2, 5)
             }),
+            compose: cx.new(|cx| {
+                TextareaState::new(window, cx)
+                    .placeholder("Message this participant…")
+                    .auto_grow(2, 5)
+            }),
+            participant_query: cx
+                .new(|cx| InputState::new(window, cx).placeholder("Find participant")),
+            show_workers: false,
+            recent_first: true,
+            participant_width: 200.,
+            thread_width: 360.,
         }
     }
 
@@ -324,9 +414,46 @@ impl Messenger {
             let _ = this.update(cx, |this, cx| {
                 let current = this.revision == revision;
                 let switching = current && candidate.is_some() && result.is_ok();
+                let save = if switching {
+                    match (candidate.as_ref(), this.save_password.take()) {
+                        (Some(Connection::Remote { url, token }), Some(password)) => Some((
+                            remote_store::Remote { url: url.clone(), token: token.clone() },
+                            password,
+                        )),
+                        _ => None,
+                    }
+                } else {
+                    if current && candidate.is_some() {
+                        this.save_password = None;
+                    }
+                    None
+                };
                 this.finish_load(revision, candidate, result);
                 if switching {
                     this.start_watch(cx);
+                }
+                if let Some((remote, password)) = save {
+                    let task = cx.background_executor().spawn(async move {
+                        let path = backend::remote_path().map_err(|e| e.message)?;
+                        remote_store::save(&path, &password, &remote).map_err(|e| e.to_string())
+                    });
+                    cx.spawn(async move |this, cx| {
+                        let result = task.await;
+                        let _ = this.update(cx, |this, cx| {
+                            match result {
+                                Ok(()) => {
+                                    this.remote_saved = true;
+                                    this.new_remote = false;
+                                    this.note = "Remote connection saved securely.".into();
+                                }
+                                Err(error) => {
+                                    this.error = format!("Connected, but could not save: {error}")
+                                }
+                            }
+                            cx.notify();
+                        });
+                    })
+                    .detach();
                 }
                 if current && this.refresh_pending && !this.writing {
                     this.refresh_pending = false;
@@ -374,11 +501,9 @@ impl Messenger {
                 // Keep loaded history while the room is open. A moving recent window must
                 // not remove the messages a reader is looking at.
                 let top = self.scroll.top_item();
-                let roots: Vec<_> = self
-                    .messages
-                    .iter()
-                    .filter(|m| root_id(&self.messages, &m.id) == m.id)
-                    .collect();
+                let old_roots = thread_roots(&self.messages);
+                let roots: Vec<_> =
+                    self.messages.iter().filter(|m| old_roots.get(&m.id) == Some(&m.id)).collect();
                 let anchor = roots
                     .get(top.saturating_sub(usize::from(self.next_offset.is_some())))
                     .map(|m| m.id.clone());
@@ -411,9 +536,10 @@ impl Messenger {
                             all.push(message.clone());
                         }
                     }
-                    let root = root_id(&all, id);
+                    let roots = thread_roots(&all);
+                    let root = roots.get(id);
                     self.thread_cache =
-                        all.iter().filter(|m| root_id(&all, &m.id) == root).cloned().collect();
+                        all.iter().filter(|m| roots.get(&m.id) == root).cloned().collect();
                 }
                 self.next_offset = snapshot.page.next_offset;
                 if !self
@@ -463,12 +589,54 @@ impl Messenger {
     fn connect_remote(&mut self, cx: &mut Context<Self>) {
         let url = self.url.read(cx).value().trim().to_string();
         let token = self.token.read(cx).value().trim().to_string();
-        if url.is_empty() || token.is_empty() {
-            self.error = "Enter the HTTP address and server access token.".into();
+        let password = self.password.read(cx).value().to_string();
+        if url.is_empty() || token.is_empty() || password.len() < 8 {
+            self.error = "Enter the HTTP address, access token, and an encryption password of at least 8 characters.".into();
             cx.notify();
             return;
         }
+        self.save_password = Some(password);
+        self.reset_password = true;
         self.start_load(Some(Connection::Remote { url, token }), cx);
+    }
+
+    fn unlock_remote(&mut self, cx: &mut Context<Self>) {
+        let password = self.password.read(cx).value().to_string();
+        if password.is_empty() || self.unlocking {
+            return;
+        }
+        let path = match backend::remote_path() {
+            Ok(path) => path,
+            Err(error) => {
+                self.error = error.message;
+                cx.notify();
+                return;
+            }
+        };
+        self.unlocking = true;
+        self.error.clear();
+        let task = cx.background_executor().spawn(async move {
+            remote_store::open(&path, &password).map_err(|e| format!("{e:#}"))
+        });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |this, cx| {
+                this.unlocking = false;
+                match result {
+                    Ok(remote) => {
+                        this.reset_password = true;
+                        this.start_load(
+                            Some(Connection::Remote { url: remote.url, token: remote.token }),
+                            cx,
+                        );
+                    }
+                    Err(error) => this.error = error,
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
     }
 
     fn act(&mut self, reply: bool, cx: &mut Context<Self>) {
@@ -519,6 +687,57 @@ impl Messenger {
                         this.error =
                             format!("{error}. Refresh to check the result before retrying.");
                         this.refresh_pending = false;
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn post(&mut self, cx: &mut Context<Self>) {
+        if self.writing || self.loading || !self.connected {
+            return;
+        }
+        let Some(to) = self.session.clone() else {
+            return;
+        };
+        let body = self.compose.read(cx).value().trim().to_string();
+        if body.is_empty() {
+            self.error = "Write a message first.".into();
+            cx.notify();
+            return;
+        }
+        let mut bytes = [0u8; 16];
+        if ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut bytes).is_err() {
+            self.error = "Could not create a message ID.".into();
+            cx.notify();
+            return;
+        }
+        let id = format!("u{}", bytes.iter().map(|byte| format!("{byte:02x}")).collect::<String>());
+        let connection = self.connection.clone();
+        let revision = self.revision;
+        self.writing = true;
+        self.error.clear();
+        let task = cx.background_executor().spawn(async move {
+            connection.call(&Request::Post { id, to, body }).map_err(|e| format!("{e:#}"))
+        });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |this, cx| {
+                if this.revision != revision {
+                    return;
+                }
+                this.writing = false;
+                match result {
+                    Ok(_) => {
+                        this.reset_compose = true;
+                        this.note = "Message sent.".into();
+                        this.refresh(cx);
+                    }
+                    Err(error) => {
+                        this.error = format!("{error}. Check the conversation before retrying.")
                     }
                 }
                 cx.notify();
@@ -590,37 +809,81 @@ impl Messenger {
                 .child(crate::muted(format!("Reconnecting… {}", self.stream_error)).text_xs());
         }
         if self.remote_form {
-            header = header.child(
-                div()
-                    .id("remote-ccs-form")
-                    .test_support()
-                    .v_flex()
-                    .gap_2()
-                    .pt_2()
-                    .child(crate::muted("Remote CCS · HTTP connection"))
+            let mut form = div()
+                .id("remote-ccs-form")
+                .test_support()
+                .v_flex()
+                .gap_2()
+                .p_4()
+                .rounded_md()
+                .bg(rgb(0xf6f8fc))
+                .child(div().font_semibold().child(if self.remote_saved && !self.new_remote {
+                    "Unlock saved Remote CCS"
+                } else {
+                    "Connect to Remote CCS"
+                }))
+                .child(
+                    crate::muted(if self.remote_saved && !self.new_remote {
+                        "Enter the password used to encrypt this connection."
+                    } else {
+                        "The address and access token will be encrypted on this device."
+                    })
+                    .text_xs(),
+                );
+            if self.remote_saved && !self.new_remote {
+                form = form.child(Input::new(&self.password).id("remote-password")).child(
+                    div()
+                        .flex()
+                        .gap_2()
+                        .child(
+                            Button::new("unlock-remote-ccs")
+                                .label(if self.unlocking {
+                                    "Unlocking…"
+                                } else {
+                                    "Unlock & connect"
+                                })
+                                .disabled(self.unlocking || self.loading || self.writing)
+                                .on_click(cx.listener(|this, _, _, cx| this.unlock_remote(cx))),
+                        )
+                        .child(
+                            Button::new("different-remote-ccs")
+                                .ghost()
+                                .label("Use another server")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.new_remote = true;
+                                    cx.notify();
+                                })),
+                        ),
+                );
+            } else {
+                form = form
+                    .child(crate::muted("Server URL").text_xs())
                     .child(
                         Input::new(&self.url)
                             .id("remote-url")
                             .disabled(self.loading || self.writing),
                     )
+                    .child(crate::muted("Access token").text_xs())
                     .child(
                         Input::new(&self.token)
                             .id("remote-token")
                             .disabled(self.loading || self.writing),
                     )
+                    .child(crate::muted("Encryption password").text_xs())
                     .child(
-                        div().flex().gap_2().child(
-                            Button::new("connect-remote-ccs")
-                                .label("Connect")
-                                .disabled(self.loading || self.writing)
-                                .on_click(cx.listener(|this, _, _, cx| this.connect_remote(cx))),
-                        ),
+                        Input::new(&self.password)
+                            .id("remote-password")
+                            .disabled(self.loading || self.writing),
                     )
                     .child(
-                        crate::muted("The access token stays in memory for this app session.")
-                            .text_xs(),
-                    ),
-            );
+                        Button::new("connect-remote-ccs")
+                            .label("Connect & save encrypted")
+                            .disabled(self.loading || self.writing)
+                            .on_click(cx.listener(|this, _, _, cx| this.connect_remote(cx))),
+                    )
+                    .child(crate::muted("8+ characters · needed again after restart").text_xs());
+            }
+            header = header.child(form);
         }
         header
     }
@@ -644,15 +907,24 @@ fn status_color(message: &Message) -> Rgba {
         _ => rgb(0x946200),
     }
 }
-fn root_id(messages: &[Message], id: &str) -> String {
-    let mut current = id;
-    for _ in 0..messages.len() {
-        match messages.iter().find(|m| m.id == current).and_then(|m| m.reply_to.as_deref()) {
-            Some(parent) if messages.iter().any(|m| m.id == parent) => current = parent,
-            _ => break,
+fn thread_roots(messages: &[Message]) -> HashMap<String, String> {
+    let by_id: HashMap<_, _> = messages.iter().map(|m| (m.id.as_str(), m)).collect();
+    let mut roots: HashMap<String, String> = HashMap::with_capacity(messages.len());
+    for message in messages {
+        let mut current = message.id.as_str();
+        for _ in 0..messages.len() {
+            if let Some(root) = roots.get(current) {
+                current = root.as_str();
+                break;
+            }
+            match by_id.get(current).and_then(|m| m.reply_to.as_deref()) {
+                Some(parent) if by_id.contains_key(parent) => current = parent,
+                _ => break,
+            }
         }
+        roots.insert(message.id.clone(), current.to_string());
     }
-    current.to_string()
+    roots
 }
 
 fn message_time(message: &Message) -> String {
@@ -684,8 +956,16 @@ impl Render for Messenger {
             self.answer.update(cx, |input, cx| input.set_value("", window, cx));
             self.reset_answer = false;
         }
+        if self.reset_compose {
+            self.compose.update(cx, |input, cx| input.set_value("", window, cx));
+            self.reset_compose = false;
+        }
+        if self.reset_password {
+            self.password.update(cx, |input, cx| input.set_value("", window, cx));
+            self.reset_password = false;
+        }
         let height = (window.viewport_size().height - px(160.)).max(px(340.));
-        let narrow = window.viewport_size().width < px(900.);
+        let narrow = window.viewport_size().width < px(820.);
         let mut content = div().v_flex().h(height).gap_3().child(self.connection_header(cx));
         if !self.error.is_empty() {
             content = content.child(
@@ -704,12 +984,30 @@ impl Render for Messenger {
                 .child(crate::muted("Registered sessions appear here. Connect your local CCS or view a remote server.")));
         }
         let mut all = self.messages.clone();
+        let mut seen: HashSet<_> = all.iter().map(|m| m.id.clone()).collect();
         for message in &self.thread_cache {
-            if !all.iter().any(|m| m.id == message.id) {
+            if seen.insert(message.id.clone()) {
                 all.push(message.clone());
             }
         }
         all.sort_by_key(|m| m.sequence);
+        let query = self.participant_query.read(cx).value().to_string();
+        let visible =
+            visible_sessions(&self.sessions, &query, self.show_workers, self.recent_first);
+        let worker_count = self
+            .sessions
+            .iter()
+            .filter(|s| s.labels.get("role").is_some_and(|role| role == "worker"))
+            .count();
+        let roots = thread_roots(&all);
+        let mut replies_by_root = HashMap::<&str, usize>::new();
+        for message in &all {
+            if let Some(root) = roots.get(&message.id)
+                && root != &message.id
+            {
+                *replies_by_root.entry(root).or_default() += 1;
+            }
+        }
         let selected =
             self.selected.as_ref().and_then(|id| all.iter().find(|m| &m.id == id)).cloned();
         let mut room = div().flex_1().min_w_0().v_flex().gap_2();
@@ -734,8 +1032,35 @@ impl Render for Messenger {
                     ),
             );
         if narrow {
+            room = room.child(
+                div()
+                    .flex()
+                    .gap_1()
+                    .items_center()
+                    .child(Input::new(&self.participant_query).id("participant-filter-narrow"))
+                    .child(
+                        Button::new("participants-sort-narrow")
+                            .small()
+                            .ghost()
+                            .label(if self.recent_first { "Recent ↓" } else { "Name ↑" })
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.recent_first = !this.recent_first;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("participants-workers-narrow")
+                            .small()
+                            .ghost()
+                            .label(format!("Workers {worker_count}"))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.show_workers = !this.show_workers;
+                                cx.notify();
+                            })),
+                    ),
+            );
             let mut people = div().id("participant-strip").flex().gap_1().overflow_x_scroll();
-            for session in &self.sessions {
+            for session in &visible {
                 let name = session.name.clone();
                 people = people.child(
                     Button::new(SharedString::from(format!("session-{name}")))
@@ -755,7 +1080,7 @@ impl Render for Messenger {
             && let Some(index) = self
                 .messages
                 .iter()
-                .filter(|m| root_id(&self.messages, &m.id) == m.id)
+                .filter(|m| roots.get(&m.id) == Some(&m.id))
                 .position(|m| m.id == id)
         {
             let index = index + usize::from(self.next_offset.is_some());
@@ -787,11 +1112,10 @@ impl Render for Messenger {
                     })),
             );
         }
-        for message in self.messages.iter().filter(|m| root_id(&self.messages, &m.id) == m.id) {
+        let selected_root = selected.as_ref().and_then(|m| roots.get(&m.id));
+        for message in self.messages.iter().filter(|m| roots.get(&m.id) == Some(&m.id)) {
             let id = message.id.clone();
-            let selected_root = selected.as_ref().map(|m| root_id(&all, &m.id));
-            let descendants =
-                all.iter().filter(|m| m.id != id && root_id(&all, &m.id) == id).count();
+            let descendants = replies_by_root.get(id.as_str()).copied().unwrap_or(0);
             let replies = descendants + usize::from(message.reply.is_some() && descendants == 0);
             let preview: String = message.body.chars().take(420).collect();
             let preview =
@@ -805,7 +1129,7 @@ impl Render for Messenger {
                     .p_3()
                     .rounded_md()
                     .cursor_pointer()
-                    .when(selected_root.as_ref() == Some(&id), |d| d.bg(rgb(0xf0f4fc)))
+                    .when(selected_root == Some(&id), |d| d.bg(rgb(0xf0f4fc)))
                     .on_click(cx.listener(move |this, _, window, cx| {
                         if this.writing {
                             return;
@@ -889,23 +1213,54 @@ impl Render for Messenger {
                     })),
             );
         }
-        room = room.child(
-            crate::muted("Select a message to reply in its thread. Viewing does not mark it read.")
-                .text_xs(),
-        );
+        if let Some(target) = &self.session {
+            room = room.child(
+                div()
+                    .id("new-message")
+                    .v_flex()
+                    .gap_2()
+                    .p_2()
+                    .rounded_md()
+                    .bg(rgb(0xf6f8fc))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(crate::muted(format!("You → {target}")).text_xs())
+                            .child(
+                                Button::new("send-new-message")
+                                    .small()
+                                    .label("Send message")
+                                    .disabled(self.loading || self.writing || !self.connected)
+                                    .on_click(cx.listener(|this, _, _, cx| this.post(cx))),
+                            ),
+                    )
+                    .child(Textarea::new(&self.compose).disabled(self.writing)),
+            );
+        } else {
+            room = room.child(
+                crate::muted("Choose a participant to send a message, or open a thread to reply.")
+                    .text_xs(),
+            );
+        }
         let mut layout = div().flex().flex_1().min_h_0().gap_4();
         if !narrow || selected.is_none() {
             layout = layout.child(room);
         }
         if let Some(message) = selected {
-            let root = root_id(&all, &message.id);
+            let root = roots.get(&message.id);
             let mut thread = div()
                 .id("message-detail")
                 .v_flex()
                 .gap_3()
                 .min_h_0()
                 .when(!narrow, |d| {
-                    d.w(px(360.)).flex_shrink_0().pl_4().border_l_1().border_color(rgb(0xe5e7eb))
+                    d.w(px(self.thread_width))
+                        .flex_shrink_0()
+                        .pl_4()
+                        .border_l_1()
+                        .border_color(rgb(0xe5e7eb))
                 })
                 .when(narrow, |d| d.flex_1())
                 .child(
@@ -914,6 +1269,31 @@ impl Render for Messenger {
                         .justify_between()
                         .items_center()
                         .child(div().font_semibold().child("Thread"))
+                        .child(
+                            div()
+                                .flex()
+                                .gap_1()
+                                .child(
+                                    Button::new("thread-narrower")
+                                        .small()
+                                        .ghost()
+                                        .label("−")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.thread_width = (this.thread_width - 40.).max(280.);
+                                            cx.notify();
+                                        })),
+                                )
+                                .child(
+                                    Button::new("thread-wider")
+                                        .small()
+                                        .ghost()
+                                        .label("+")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.thread_width = (this.thread_width + 40.).min(560.);
+                                            cx.notify();
+                                        })),
+                                ),
+                        )
                         .child(
                             Button::new("close-thread")
                                 .small()
@@ -929,7 +1309,7 @@ impl Render for Messenger {
                 );
             let mut posts =
                 div().id("thread-posts").flex_1().min_h_0().overflow_y_scroll().v_flex().gap_4();
-            for post in all.iter().filter(|m| root_id(&all, &m.id) == root) {
+            for post in all.iter().filter(|m| roots.get(&m.id) == root) {
                 let id = post.id.clone();
                 let mut entry = div()
                     .v_flex()
@@ -946,7 +1326,7 @@ impl Render for Messenger {
                     .child(crate::muted(format!("To {}", post.to)).text_xs())
                     .child(
                         div()
-                            .id(if post.id == root {
+                            .id(if root == Some(&post.id) {
                                 SharedString::from("message-body")
                             } else {
                                 SharedString::from(format!("thread-body-{}", post.id))
@@ -1021,21 +1401,95 @@ impl Render for Messenger {
             }
             layout = layout.child(thread);
         } else if !narrow {
-            let mut people = div()
-                .w(px(180.))
+            let people = div()
+                .w(px(self.participant_width))
                 .flex_shrink_0()
                 .v_flex()
-                .gap_3()
+                .gap_1()
                 .pl_4()
                 .border_l_1()
                 .border_color(rgb(0xe5e7eb))
-                .child(crate::muted(format!("PARTICIPANTS · {}", self.sessions.len())).text_xs());
-            for session in &self.sessions {
-                let name = session.name.clone();
-                people = people.child(
+                .child(
                     div()
-                        .v_flex()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(
+                            crate::muted(format!("PARTICIPANTS · {}", self.sessions.len()))
+                                .text_xs(),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .gap_1()
+                                .child(
+                                    Button::new("participants-narrower")
+                                        .small()
+                                        .ghost()
+                                        .label("−")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.participant_width =
+                                                (this.participant_width - 40.).max(160.);
+                                            cx.notify();
+                                        })),
+                                )
+                                .child(
+                                    Button::new("participants-wider")
+                                        .small()
+                                        .ghost()
+                                        .label("+")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.participant_width =
+                                                (this.participant_width + 40.).min(400.);
+                                            cx.notify();
+                                        })),
+                                ),
+                        ),
+                )
+                .child(Input::new(&self.participant_query).id("participant-filter"))
+                .child(
+                    div()
+                        .flex()
                         .gap_1()
+                        .child(
+                            Button::new("participants-sort")
+                                .small()
+                                .ghost()
+                                .label(if self.recent_first { "Recent ↓" } else { "Name ↑" })
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.recent_first = !this.recent_first;
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            Button::new("participants-workers")
+                                .small()
+                                .ghost()
+                                .label(if self.show_workers {
+                                    format!("Workers {worker_count} ✓")
+                                } else {
+                                    format!("Workers {worker_count}")
+                                })
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.show_workers = !this.show_workers;
+                                    cx.notify();
+                                })),
+                        ),
+                )
+                .child(crate::muted(format!("{} shown", visible.len())).text_xs());
+            let mut rows = div()
+                .id("participant-list")
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scroll()
+                .v_flex()
+                .gap_1();
+            for session in &visible {
+                let name = session.name.clone();
+                rows = rows.child(
+                    div()
+                        .flex()
+                        .items_center()
                         .child(
                             Button::new(SharedString::from(format!("session-{name}")))
                                 .small()
@@ -1047,21 +1501,10 @@ impl Render for Messenger {
                                     this.choose_session(Some(name.clone()), window, cx)
                                 })),
                         )
-                        .child(
-                            crate::muted(format!(
-                                "{}{}",
-                                session.provider,
-                                session
-                                    .labels
-                                    .get("role")
-                                    .map(|r| format!(" · {r}"))
-                                    .unwrap_or_default()
-                            ))
-                            .text_xs(),
-                        ),
+                        .child(crate::muted(session.provider.clone()).text_xs()),
                 );
             }
-            layout = layout.child(people);
+            layout = layout.child(people.child(rows));
         }
         content.child(layout)
     }
@@ -1081,6 +1524,7 @@ mod tests {
                 name: name.into(),
                 provider: "codex".into(),
                 labels: [("role".into(), "manager".into())].into(),
+                last_activity: 3,
             }],
             session: Some(name.into()),
             page: MessagePage {
@@ -1153,6 +1597,68 @@ mod tests {
     }
 
     #[test]
+    fn participants_hide_workers_and_sort_by_activity_or_name() {
+        let mut rows = snapshot("z-manager").sessions;
+        let mut worker = rows[0].clone();
+        worker.name = "a-worker".into();
+        worker.labels.insert("role".into(), "worker".into());
+        worker.last_activity = 10;
+        let mut chief = rows[0].clone();
+        chief.name = "b-chief".into();
+        chief.last_activity = 5;
+        rows.extend([worker, chief]);
+        assert_eq!(
+            super::visible_sessions(&rows, "", false, true)
+                .iter()
+                .map(|r| r.name.as_str())
+                .collect::<Vec<_>>(),
+            ["b-chief", "z-manager"]
+        );
+        assert_eq!(
+            super::visible_sessions(&rows, "", true, false)
+                .iter()
+                .map(|r| r.name.as_str())
+                .collect::<Vec<_>>(),
+            ["a-worker", "b-chief", "z-manager"]
+        );
+        assert_eq!(super::visible_sessions(&rows, "worker", true, true).len(), 1);
+    }
+
+    #[gpui_kit::test]
+    fn participant_controls_reveal_workers_and_resize_sidebar(cx: &mut TestAppContext) {
+        use gpui_kit::{px, size};
+        cx.update(gpui_kit::init);
+        let mut entity = None;
+        let handle = cx.add_window(|window, cx| {
+            let view = cx.new(|cx| {
+                let mut view = Messenger::new(window, cx);
+                let mut data = snapshot("manager");
+                data.session = None;
+                let mut worker = data.sessions[0].clone();
+                worker.name = "worker".into();
+                worker.labels.insert("role".into(), "worker".into());
+                data.sessions.push(worker);
+                view.finish_load(0, None, Ok(data));
+                view
+            });
+            entity = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        cx.simulate_window_resize(handle.into(), size(px(1100.), px(800.)));
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("session-worker").is_none());
+            window.click("participants-workers", cx);
+            window.render_frame(cx);
+            assert!(window.try_find("session-worker").is_some());
+            window.click("participants-wider", cx);
+            entity.as_ref().unwrap().update(cx, |view, _| assert_eq!(view.participant_width, 240.));
+        })
+        .unwrap();
+    }
+
+    #[test]
     fn reply_chains_share_a_root_without_grouping_unrelated_messages() {
         let mut messages = snapshot("local").page.messages;
         let mut reply = messages[0].clone();
@@ -1166,9 +1672,10 @@ mod tests {
         let mut unrelated = messages[0].clone();
         unrelated.id = "other".into();
         messages.extend([reply, followup, unrelated]);
-        assert_eq!(super::root_id(&messages, "r2"), "m1");
-        assert_eq!(super::root_id(&messages, "other"), "other");
-        assert_eq!(super::root_id(&messages, "missing"), "missing");
+        let roots = super::thread_roots(&messages);
+        assert_eq!(roots["r2"], "m1");
+        assert_eq!(roots["other"], "other");
+        assert!(!roots.contains_key("missing"));
     }
 
     #[gpui_kit::test]
