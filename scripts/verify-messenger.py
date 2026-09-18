@@ -184,6 +184,23 @@ with tempfile.TemporaryDirectory(prefix='ccs-msg-') as tmp:
         assert state['sessions']['carol']['endpoint']['socket'] == str(second_socket)
         assert state['sessions']['carol']['labels']['role'] == 'worker'
         bindings.write_text(json.dumps({str(root): {'name':'carol','provider':'claude','bypass':True}}))
+        hook_script = str(Path(__file__).with_name('ccs-session-bind.py'))
+        worker_env = dict(claude_env, CCS_BIN=binary, CCS_BINDINGS_FILE=str(bindings))
+        event = json.dumps({'hook_event_name':'SessionStart','cwd':str(root),'session_id':'worker-session'})
+        for flag in ('-p', '--print'):
+            parent = ('import subprocess,sys; '
+                      'cmd=[sys.argv[3],sys.argv[2]] if sys.argv[1]=="-p" else '
+                      '["/bin/sh","-c","$1 $2; :","hook",sys.argv[3],sys.argv[2]]; '
+                      'p=subprocess.run(cmd, '
+                      'input=sys.stdin.read(),text=True); sys.exit(p.returncode)')
+            worker = subprocess.run(['claude', '-c', parent, flag, hook_script, sys.executable], executable=sys.executable,
+                input=event, env=worker_env, text=True, capture_output=True, timeout=10)
+            assert worker.returncode == 0, repr(worker)
+            assert json.loads((root / 'bus/state.json').read_text())['sessions']['carol']['endpoint']['socket'] == str(second_socket)
+        opt_out = subprocess.run([sys.executable, hook_script], input=event,
+            env=dict(worker_env, CCS_NO_BIND='1'), text=True, capture_output=True, timeout=10)
+        assert opt_out.returncode == 0, opt_out.stderr
+        assert json.loads((root / 'bus/state.json').read_text())['sessions']['carol']['endpoint']['socket'] == str(second_socket)
         hook = subprocess.run([sys.executable, str(Path(__file__).with_name('ccs-session-bind.py'))],
             input=json.dumps({'hook_event_name':'SessionStart','cwd':str(root),'session_id':'carol-session'}),
             env=dict(rebound_env, CCS_BIN=binary, CCS_BINDINGS_FILE=str(bindings)),

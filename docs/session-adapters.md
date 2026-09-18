@@ -46,9 +46,9 @@ and `--codex` options remain aliases. The current stored JSON format is unchange
 
 Inbox storage, labels, name exclusivity, queue correlation, history, HTTP/SSE and
 GPUI do not need provider-specific changes. Inbox messages stay in CCS until
-read; only queue dispatch invokes `deliver`. The delivered body includes the
-message ID and `ccs reply` instruction; the recipient replies through the common
-CCS API. Replies and reads trigger the same streams for every adapter.
+acknowledged; both inbox and queue sends invoke `deliver`. The delivered body
+includes the message ID; the recipient replies through the common CCS API.
+Replies and reads trigger the same streams for every adapter.
 
 Account-usage notifications (`ccs notify`) are a separate feature. They currently
 support Claude and Codex; adding a messenger adapter does not add account usage

@@ -83,7 +83,7 @@ ccs session register review-worker --codex --label role=worker
 ccs sessions
 ```
 
-Set `CCS_SESSION=<name>` or pass `--session <name>` on message commands. A name belongs to one provider account; run `ccs session bind <name> --codex` or `--claude` inside a replacement session to refresh its endpoint without dropping history. `ccs session remove <name>` removes the registration while preserving message history. Registrations for Claude workers whose messaging socket has disappeared are automatically removed; temporary Codex workers should remove their registration at task end, and their launcher should clean up after an abnormal exit. Long-lived sessions remain registered.
+Set `CCS_SESSION=<name>` or pass `--session <name>` on message commands. A name belongs to one provider account; run `ccs session bind <name> --codex` or `--claude` inside a replacement session to refresh its endpoint without dropping history. If a SessionStart hook binds stable names, launch one-shot workers with `CCS_NO_BIND=1`; the included hook also skips Claude `-p`/`--print` sessions. `ccs session remove <name>` removes the registration while preserving message history. Registrations for Claude workers whose messaging socket has disappeared are automatically removed; temporary Codex workers should remove their registration at task end, and their launcher should clean up after an abnormal exit. Long-lived sessions remain registered.
 
 ```sh
 ccs inbox send frontend --session review-worker --message 'Review is ready'
