@@ -52,15 +52,22 @@ with tempfile.TemporaryDirectory(prefix='ccs-msg-') as tmp:
         assert 'exactly one' in run('inbox', 'send', '--label', 'role=manager', '--message', 'ambiguous', ok=False)
         assert 'exactly one' in run('inbox', 'send', 'missing', '--message', 'missing', ok=False)
         m = run('inbox', 'send', '--label', 'repo=web', '--message', 'review later')
-        assert m['receipt'] == {'stored': True, 'delivered': False, 'read': False}
-        assert not (root / 'delivered').exists(), 'inbox must not push'
-        assert run('inbox', session='bob')['messages'][0]['id'] == m['id']
+        assert m['receipt']['stored'] is True and m['receipt']['read'] is False
+        assert m['receipt']['unread_for_ms'] >= 0
+        assert m['id'] in (root / 'delivered').read_text(), 'inbox must wake recipient'
+        assert run('message', m['id'])['receipt']['unread_for_ms'] >= 0
+        first_read = run('inbox', session='bob')['messages'][0]
+        assert first_read['id'] == m['id'] and first_read['status'] == 'read'
         assert run('inbox', session='bob')['messages'][0]['id'] == m['id'], 'read must not consume'
+        assert run('message', m['id'])['receipt']['read'] is True
         run('reply', m['id'], '--message', 'wrong recipient', ok=False)
-        assert run('inbox', 'ack', m['id'], session='bob')['receipt'] == {'stored': True, 'delivered': True, 'read': True}
+        handled = run('inbox', 'ack', m['id'], session='bob')
+        assert handled['status'] == 'handled' and handled['receipt']['read'] is True
         assert run('inbox', session='bob')['messages'] == []
         question = run('inbox', 'send', 'bob', '--message', 'async question')
+        (root / 'delivered').unlink()
         run('reply', question['id'], '--message', 'async answer', session='bob')
+        assert ('r' + question['id']) in (root / 'delivered').read_text(), 'reply inbox must wake sender'
         answer = run('inbox')['messages'][0]
         assert answer['reply_to'] == question['id'] and answer['body'] == 'async answer'
         run('inbox', 'ack', answer['id'])
@@ -76,13 +83,26 @@ with tempfile.TemporaryDirectory(prefix='ccs-msg-') as tmp:
             offset = page['next_offset']
         assert set(seen) == set(ids) and len(seen) == len(ids)
         for mid in ids: run('inbox', 'ack', mid, session='bob')
+        read_only = run('inbox', 'send', 'bob', '--message', 'read state survives restart')
+        assert any(m['id'] == read_only['id'] and m['status'] == 'read' for m in run('inbox', session='bob')['messages'])
         # Restart retains sessions and messages; a second daemon must not steal the socket.
         second = subprocess.run([binary, 'server'], env=base, capture_output=True, timeout=5)
         assert second.returncode != 0
         server.terminate(); server.wait(timeout=5)
         server = start()
-        assert run('message', m['id'])['status'] == 'read'
+        assert run('message', m['id'])['status'] == 'handled'
+        assert run('message', read_only['id'])['status'] == 'read'
+        run('inbox', 'ack', read_only['id'], session='bob')
+        # A pre-upgrade "read" meant acknowledged, so migrate it to handled once.
+        server.terminate(); server.wait(timeout=5)
+        old_state = json.loads((root / 'bus/state.json').read_text())
+        old_state.pop('schema_version')
+        old_state['messages'][m['id']]['status'] = 'read'
+        (root / 'bus/state.json').write_text(json.dumps(old_state))
+        server = start()
+        assert run('message', m['id'])['status'] == 'handled'
         payload = 'What type? $(touch must-not-exist) `literal`\nsecond line'
+        (root / 'delivered').unlink()
         waiting = subprocess.Popen([binary, 'queue', 'bob', '--message', payload, '--timeout', '5'], env=env(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         for _ in range(100):
             if (root / 'delivered').exists(): break
@@ -240,6 +260,10 @@ with tempfile.TemporaryDirectory(prefix='ccs-msg-') as tmp:
                    for m in run('inbox', session='dave')['messages'])
         assert any(m['body'] == 'dead socket must fail' and m['receipt'] == {'stored': True, 'delivered': False, 'read': False}
                    for m in run('inbox', session='dave')['messages'])
+        unwoken = run('inbox', 'send', 'dave', '--message', 'wake failed but message is stored')
+        assert unwoken['status'] == 'pending' and 'target-endpoint-dead' in unwoken['error']
+        assert unwoken['receipt']['unread_for_ms'] >= 0
+        assert any(m['id'] == unwoken['id'] and m['status'] == 'read' for m in run('inbox', session='dave')['messages'])
         assert not any(x['name'] == 'carol' for x in run('sessions'))
         assert query(dict(op='message', session='alice', id=answered['id']))['reply'] == 'Claude answer'
 

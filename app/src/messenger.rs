@@ -14,6 +14,7 @@ use gpui_kit::base::TestSupportExt;
 use gpui_kit::component::{
     button::*,
     input::{Input, InputState, Textarea, TextareaState},
+    menu::DropdownMenu,
     *,
 };
 use gpui_kit::prelude::FluentBuilder;
@@ -217,6 +218,7 @@ pub struct Messenger {
     url: Entity<InputState>,
     token: Entity<InputState>,
     password: Entity<InputState>,
+    compose_recipient: Entity<InputState>,
     answer: Entity<TextareaState>,
     compose: Entity<TextareaState>,
     participant_query: Entity<InputState>,
@@ -289,13 +291,13 @@ impl Messenger {
                     .placeholder("Encryption password (8+ characters)")
                     .masked(true)
             }),
+            compose_recipient: cx
+                .new(|cx| InputState::new(window, cx).placeholder("Choose an agent")),
             answer: cx.new(|cx| {
                 TextareaState::new(window, cx).placeholder("Write a reply…").auto_grow(2, 5)
             }),
             compose: cx.new(|cx| {
-                TextareaState::new(window, cx)
-                    .placeholder("Message this participant…")
-                    .auto_grow(2, 5)
+                TextareaState::new(window, cx).placeholder("Write a new message…").auto_grow(2, 5)
             }),
             participant_query: cx
                 .new(|cx| InputState::new(window, cx).placeholder("Find participant")),
@@ -582,6 +584,10 @@ impl Messenger {
     ) {
         self.clear_selection();
         self.session = name;
+        if let Some(name) = &self.session {
+            self.compose_recipient
+                .update(cx, |input, cx| input.set_value(name.clone(), window, cx));
+        }
         self.answer.update(cx, |input, cx| input.set_value("", window, cx));
         self.start_load(None, cx);
     }
@@ -678,7 +684,7 @@ impl Messenger {
                 this.writing = false;
                 match result {
                     Ok(_) => {
-                        this.note = if reply { "Reply sent." } else { "Marked as read." }.into();
+                        this.note = if reply { "Reply sent." } else { "Marked handled." }.into();
                         this.refresh_pending = false;
                         this.reset_answer = reply;
                         this.refresh(cx);
@@ -700,9 +706,12 @@ impl Messenger {
         if self.writing || self.loading || !self.connected {
             return;
         }
-        let Some(to) = self.session.clone() else {
+        let to = self.compose_recipient.read(cx).value().trim().to_string();
+        if !self.sessions.iter().any(|session| session.name == to) {
+            self.error = "Choose a registered agent to receive this message.".into();
+            cx.notify();
             return;
-        };
+        }
         let body = self.compose.read(cx).value().trim().to_string();
         if body.is_empty() {
             self.error = "Write a message first.".into();
@@ -897,13 +906,14 @@ fn status_text(message: &Message) -> &'static str {
         "failed" => "Delivery failed",
         "answered" => "Answered",
         "read" => "Read",
+        "handled" => "Handled",
         _ => "Unknown",
     }
 }
 fn status_color(message: &Message) -> Rgba {
     match message.status.as_str() {
         "failed" => rgb(0xb42318),
-        "answered" | "read" => rgb(0x067647),
+        "answered" | "read" | "handled" => rgb(0x067647),
         _ => rgb(0x946200),
     }
 }
@@ -1213,37 +1223,81 @@ impl Render for Messenger {
                     })),
             );
         }
-        if let Some(target) = &self.session {
-            room = room.child(
-                div()
-                    .id("new-message")
-                    .v_flex()
-                    .gap_2()
-                    .p_2()
-                    .rounded_md()
-                    .bg(rgb(0xf6f8fc))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .child(crate::muted(format!("You → {target}")).text_xs())
-                            .child(
-                                Button::new("send-new-message")
-                                    .small()
-                                    .label("Send message")
-                                    .disabled(self.loading || self.writing || !self.connected)
-                                    .on_click(cx.listener(|this, _, _, cx| this.post(cx))),
-                            ),
-                    )
-                    .child(Textarea::new(&self.compose).disabled(self.writing)),
-            );
-        } else {
-            room = room.child(
-                crate::muted("Choose a participant to send a message, or open a thread to reply.")
-                    .text_xs(),
-            );
-        }
+        let recipient_input = self.compose_recipient.clone();
+        let recipients = self.sessions.clone();
+        room = room.child(
+            div()
+                .id("new-message")
+                .test_support()
+                .v_flex()
+                .gap_2()
+                .p_2()
+                .rounded_md()
+                .bg(rgb(0xf6f8fc))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_2()
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .child(crate::muted("You →").text_xs())
+                                .child(div().w(px(160.)).child(
+                                    Input::new(&self.compose_recipient).id("compose-recipient"),
+                                ))
+                                .child(
+                                    Button::new("recipient-options")
+                                        .small()
+                                        .ghost()
+                                        .label("Agents ▾")
+                                        .disabled(self.writing)
+                                        .dropdown_menu(move |mut menu, _, cx| {
+                                            let query =
+                                                recipient_input.read(cx).value().to_string();
+                                            for session in
+                                                visible_sessions(&recipients, &query, true, false)
+                                                    .into_iter()
+                                                    .take(30)
+                                            {
+                                                let name = session.name.clone();
+                                                let selected =
+                                                    recipient_input.read(cx).value().as_ref()
+                                                        == name;
+                                                let input = recipient_input.clone();
+                                                menu = menu.item(
+                                                    gpui_kit::component::menu::PopupMenuItem::new(
+                                                        name.clone(),
+                                                    )
+                                                    .checked(selected)
+                                                    .on_click(move |_, window, cx| {
+                                                        input.update(cx, |state, cx| {
+                                                            state.set_value(
+                                                                name.clone(),
+                                                                window,
+                                                                cx,
+                                                            )
+                                                        });
+                                                    }),
+                                                );
+                                            }
+                                            menu
+                                        }),
+                                ),
+                        )
+                        .child(
+                            Button::new("send-new-message")
+                                .small()
+                                .label("Send message")
+                                .disabled(self.loading || self.writing || !self.connected)
+                                .on_click(cx.listener(|this, _, _, cx| this.post(cx))),
+                        ),
+                )
+                .child(Textarea::new(&self.compose).disabled(self.writing)),
+        );
         let mut layout = div().flex().flex_1().min_h_0().gap_4();
         if !narrow || selected.is_none() {
             layout = layout.child(room);
@@ -1368,12 +1422,13 @@ impl Render for Messenger {
                 posts = posts.child(entry);
             }
             thread = thread.child(posts);
-            if message.kind == Kind::Inbox && message.status == "pending" {
+            if message.kind == Kind::Inbox && matches!(message.status.as_str(), "pending" | "read")
+            {
                 thread = thread.child(
                     Button::new("message-ack")
                         .small()
                         .ghost()
-                        .label("Mark as read")
+                        .label("Mark handled")
                         .disabled(self.loading || self.writing || !self.connected)
                         .on_click(cx.listener(|this, _, _, cx| this.act(false, cx))),
                 );
@@ -1544,6 +1599,40 @@ mod tests {
                 next_offset: None,
             },
         }
+    }
+
+    #[gpui_kit::test]
+    fn all_conversations_can_address_an_agent(cx: &mut TestAppContext) {
+        use gpui_kit::{px, size};
+        cx.update(gpui_kit::init);
+        let mut entity = None;
+        let handle = cx.add_window(|window, cx| {
+            let view = cx.new(|cx| {
+                let mut view = Messenger::new(window, cx);
+                let mut room = snapshot("manager");
+                room.session = None;
+                view.finish_load(0, None, Ok(room));
+                view
+            });
+            entity = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        cx.simulate_window_resize(handle.into(), size(px(1100.), px(800.)));
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("new-message").is_some());
+            assert!(window.try_find("compose-recipient").is_some());
+            assert!(window.try_find("recipient-options").is_some());
+            assert!(window.try_find("send-new-message").is_some());
+            entity.as_ref().unwrap().update(cx, |view, cx| {
+                assert!(view.session.is_none());
+                view.compose_recipient
+                    .update(cx, |input, cx| input.set_value("manager", window, cx));
+                assert_eq!(view.compose_recipient.read(cx).value().as_str(), "manager");
+            });
+        })
+        .unwrap();
     }
 
     #[gpui_kit::test]

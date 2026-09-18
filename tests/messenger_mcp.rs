@@ -148,9 +148,10 @@ fn compact_tools_share_cli_store_and_queue_does_not_wait_for_reply() {
     assert_eq!(inbox["messages"][0]["id"], sent["id"]);
     assert_eq!(
         inbox["messages"][0]["receipt"],
-        json!({"stored":true,"delivered":false,"read":false})
+        json!({"stored":true,"delivered":true,"read":true})
     );
-    assert!(!receiver.tool(json!({"op":"ack","id":sent["id"]})).0);
+    let (_, handled) = receiver.tool(json!({"op":"ack","id":sent["id"]}));
+    assert_eq!(handled["status"], "handled");
     assert!(sender.tool(json!({"op":"reply","id":sent["id"],"text":"not recipient"})).0);
     let mut explicit = Mcp::new(&server.dir, "unregistered-thread");
     assert!(explicit.tool(json!({"op":"inbox"})).0);

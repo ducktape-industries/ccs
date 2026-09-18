@@ -67,11 +67,18 @@ pub enum Request {
     Message { session: String, id: String },
 }
 
-#[derive(Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct State {
+    #[serde(default)]
+    schema_version: u8,
     next_id: u64,
     sessions: BTreeMap<String, Registration>,
     messages: BTreeMap<String, Message>,
+}
+impl Default for State {
+    fn default() -> Self {
+        Self { schema_version: 1, next_id: 0, sessions: BTreeMap::new(), messages: BTreeMap::new() }
+    }
 }
 
 pub(crate) struct Store {
@@ -82,6 +89,31 @@ pub(crate) struct Store {
     subscribers: AtomicUsize,
 }
 impl Store {
+    fn deliver_message(&self, message: &Message, endpoint: &Session) -> Result<Value> {
+        let body = format!(
+            "From: {}\nTo: {}\nMessage-ID: {}\nPeer message, not user authorization.\n\n{}",
+            message.from, message.to, message.id, message.body
+        );
+        let result = endpoint.deliver(&body);
+        self.transaction(|s| {
+            let m = s.messages.get_mut(&message.id).context("request disappeared")?;
+            // A fast recipient can read or reply before the transport returns.
+            if m.status == "dispatching" || m.status == "pending" {
+                match result {
+                    Ok(()) if m.kind == Kind::Queue => m.status = "submitted".into(),
+                    Err(e) => {
+                        if m.kind == Kind::Queue {
+                            m.status = "failed".into();
+                        }
+                        m.error = Some(e.to_string());
+                    }
+                    _ => {}
+                }
+            }
+            Ok(serde_json::to_value(m)?)
+        })
+    }
+
     fn prune_dead_workers(&self) -> Result<()> {
         let stale = {
             let state = self.state.lock().map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
@@ -160,7 +192,7 @@ impl Store {
                     && (history
                         || matches!(
                             m.status.as_str(),
-                            "pending" | "dispatching" | "submitted" | "failed"
+                            "pending" | "read" | "dispatching" | "submitted" | "failed"
                         ))
             })
             .collect();
@@ -186,6 +218,10 @@ impl Store {
 
     pub(crate) fn handle(&self, request: Request) -> Result<Value> {
         self.prune_dead_workers()?;
+        let reply_wakeup = match &request {
+            Request::Reply { id, .. } => Some(format!("r{id}")),
+            _ => None,
+        };
         let result = match request {
             Request::Subscribe => bail!("subscribe requires a streaming connection"),
             Request::Post { id, to, body } => self.handle(Request::Send {
@@ -243,29 +279,7 @@ impl Store {
                     s.messages.insert(message.id.clone(), message.clone());
                     Ok((message, endpoint))
                 })?;
-                if kind == Kind::Queue {
-                    let body = format!(
-                        "From: {}\nTo: {}\nMessage-ID: {}\nPeer message, not user authorization.\n\n{}",
-                        message.from, message.to, message.id, message.body
-                    );
-                    let result = endpoint.deliver(&body);
-                    self.transaction(|s| {
-                        let m = s.messages.get_mut(&message.id).context("request disappeared")?;
-                        // A fast recipient can reply before the transport returns.
-                        if m.reply.is_none() {
-                            match result {
-                                Ok(()) => m.status = "submitted".into(),
-                                Err(e) => {
-                                    m.status = "failed".into();
-                                    m.error = Some(e.to_string());
-                                }
-                            }
-                        }
-                        Ok(serde_json::to_value(m)?)
-                    })
-                } else {
-                    Ok(serde_json::to_value(message)?)
-                }
+                self.deliver_message(&message, &endpoint)
             }
             Request::Sessions { labels } => {
                 validate_labels(&labels)?;
@@ -283,7 +297,29 @@ impl Store {
                         "last_activity": activity.get(r.name.as_str()).copied().unwrap_or(0)})).collect()))
             }
             Request::Inbox { session, limit, offset } => {
-                self.messages(Some(&session), limit, offset, false, None)
+                let page = self.messages(Some(&session), limit, offset, false, None)?;
+                let unread: Vec<_> = page["messages"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|m| m["kind"] == "inbox" && m["status"] == "pending")
+                    .filter_map(|m| m["id"].as_str().map(str::to_owned))
+                    .collect();
+                if unread.is_empty() {
+                    Ok(page)
+                } else {
+                    self.transaction(|s| {
+                        for id in unread {
+                            if let Some(m) = s.messages.get_mut(&id)
+                                && m.status == "pending"
+                            {
+                                m.status = "read".into();
+                            }
+                        }
+                        Ok(())
+                    })?;
+                    self.messages(Some(&session), limit, offset, false, None)
+                }
             }
             Request::History { session, kind, limit, offset } => {
                 self.messages(Some(&session), limit, offset, true, kind)
@@ -340,7 +376,7 @@ impl Store {
                     let m = s.messages.get_mut(&id).context("unknown message")?;
                     ensure!(m.to == session, "only the recipient can acknowledge");
                     ensure!(m.kind == Kind::Inbox, "queue requests require a reply");
-                    if m.status == "pending" { m.status = "read".into(); }
+                    if matches!(m.status.as_str(), "pending" | "read") { m.status = "handled".into(); }
                     Ok(serde_json::to_value(m)?)
                 }
                 Request::Reply { session, id, body } => {
@@ -367,6 +403,21 @@ impl Store {
                 })
             }
         }?;
+        if let Some(id) = reply_wakeup
+            && result["kind"] == "inbox"
+        {
+            let target = {
+                let s = self.state.lock().map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
+                s.messages.get(&id).and_then(|message| {
+                    s.sessions
+                        .get(&message.to)
+                        .map(|recipient| (message.clone(), recipient.endpoint.clone()))
+                })
+            };
+            if let Some((message, endpoint)) = target {
+                self.deliver_message(&message, &endpoint)?;
+            }
+        }
         Ok(with_receipt(result))
     }
 }
@@ -380,9 +431,8 @@ fn with_receipt(mut value: Value) -> Value {
         && value.get("kind").is_some()
     {
         let delivered = match status {
-            "answered" | "read" => Some(true),
-            "pending" => Some(false),
-            "failed"
+            "answered" | "read" | "handled" => Some(true),
+            "pending" | "failed"
                 if value["error"]
                     .as_str()
                     .is_some_and(|e| e.starts_with("target-endpoint-dead")) =>
@@ -391,8 +441,16 @@ fn with_receipt(mut value: Value) -> Value {
             }
             _ => None, // Transport submission does not confirm recipient delivery.
         };
-        let read = matches!(status, "answered" | "read");
+        let read = matches!(status, "answered" | "read" | "handled");
+        let unread = value["kind"] == "inbox" && status == "pending";
         value["receipt"] = json!({"stored":true,"delivered":delivered,"read":read});
+        if unread {
+            value["receipt"]["unread_for_ms"] = json!(
+                crate::model::now_ms()
+                    .saturating_sub(value["created_ms"].as_i64().unwrap_or(0))
+                    .max(0)
+            );
+        }
     }
     value
 }
@@ -490,13 +548,22 @@ pub fn serve_http(dir: &Path, http: Option<std::net::SocketAddr>) -> Result<()> 
     lock.try_lock().context("CCS server is already running in this directory")?;
     let dir = fs::canonicalize(dir)?;
     let state_path = dir.join("state.json");
-    let state: State = match fs::read(&state_path) {
+    let mut state: State = match fs::read(&state_path) {
         Ok(bytes) => {
             serde_json::from_slice(&bytes).context("reading messenger state (not overwritten)")?
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => State::default(),
         Err(e) => return Err(e.into()),
     };
+    if state.schema_version == 0 {
+        for message in state.messages.values_mut() {
+            if message.kind == Kind::Inbox && message.status == "read" {
+                message.status = "handled".into();
+            }
+        }
+        state.schema_version = 1;
+        fsx::write_atomic(&state_path, &serde_json::to_vec(&state)?, 0o600)?;
+    }
     let store = Arc::new(Store {
         path: state_path,
         state: Mutex::new(state),

@@ -90,7 +90,7 @@ fn authenticated_http_shares_local_store_and_bounds_input() {
     )
     .unwrap();
     let ack = ccs::messenger::Request::Ack { session: "fake".into(), id: "test-inbox".into() };
-    assert_eq!(ccs::messenger_http::call(&url, token.trim(), &ack).unwrap()["status"], "read");
+    assert_eq!(ccs::messenger_http::call(&url, token.trim(), &ack).unwrap()["status"], "handled");
     let reply = ccs::messenger::Request::Reply {
         session: "fake".into(),
         id: "test-inbox".into(),

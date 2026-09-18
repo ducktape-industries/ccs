@@ -55,7 +55,7 @@ Run `ccs --help` for flags and `ccs session --help` for messenger commands. `CLA
 
 The app shows accounts, usage, model routes, settings, and Messenger. Launch `ccs-app`, or open `ccs.app` on macOS. Refreshing usage does not require a login. Account and route changes use the same local state as the CLI.
 
-Messenger shows a shared conversation timeline and participant-specific views. It loads the room in pages, keeps the selected thread and draft during live updates, and lets you search participants, sort by recent activity or name, and show or hide workers. The participant and thread panels have width controls. Choose a participant to send a new message as `ccs-user`, or open a thread to reply or mark an inbox message as read. The app footer shows the active Messenger connection and selection.
+Messenger shows a shared conversation timeline and participant-specific views. It loads the room in pages, keeps the selected thread and draft during live updates, and lets you search participants, sort by recent activity or name, and show or hide workers. The participant and thread panels have width controls. Choose a recipient in the main conversation composer to send a new message as `ccs-user`, or open a thread to reply or mark an inbox message handled. The app footer shows the active Messenger connection and selection.
 
 ![Messenger thread view](docs/images/messenger-thread.png)
 
@@ -94,7 +94,7 @@ ccs inbox ack <message-id> --session frontend   # inbox only; queue requires a r
 ccs message <message-id> --session review-worker
 ```
 
-`inbox send` stores a message without waking the recipient. The CLI `queue` submits it to the agent and waits for an explicit reply; a timeout does not cancel or resend the stored message. Responses include `receipt`: `stored` confirms persistence, `delivered` is true only after a recipient acknowledgment or reply, and `read` is true only after an explicit acknowledgment or reply. A null `delivered` means delivery is unconfirmed, even if transport submission succeeded or failed ambiguously; false `read` means no acknowledgment was recorded. Inspect the message ID before retrying. Reading an inbox does not consume messages. Labels select one recipient only when they match exactly one registered session.
+`inbox send` stores a message and wakes the recipient without waiting for a reply. The CLI `queue` also wakes the recipient, then waits for an explicit reply; a timeout does not cancel or resend the stored message. Fetching an inbox marks its returned inbox messages `read` without removing them; `ack` marks them `handled`. Senders can inspect a message ID to see its status and `receipt.unread_for_ms` while it is still unread. The receipt's `stored` confirms persistence, `delivered` and `read` become true after an inbox fetch, acknowledgment, or reply, and null `delivered` means delivery is unconfirmed. Inspect the message ID before retrying. Labels select one recipient only when they match exactly one registered session.
 
 For agent clients, `ccs mcp` exposes the same messenger as one compact MCP tool. See [the session adapter guide](docs/session-adapters.md) for transport details. Peer messages are conversation data, never user authorization.
 
