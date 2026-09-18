@@ -54,7 +54,7 @@ fn run() -> Result<()> {
             let options = login::Options { email, console, sso };
             cmd::add(&ctx, provider, name.as_deref(), current, &options)
         }
-        Cmd::Pin { target, args } => cmd::pin(&ctx, target.as_deref(), &args),
+        Cmd::Pin { provider, target, args } => cmd::pin(&ctx, provider, target.as_deref(), &args),
         Cmd::Remove { target } => cmd::remove(&ctx, &target),
         Cmd::Status { json, cached, provider } => {
             let needs_menu = provider.is_none() && !json && picker::interactive();

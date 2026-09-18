@@ -13,7 +13,8 @@ USAGE
     ccs routes               choose a model and its primary/fallback accounts
     ccs ls                   every stashed account and what it has left
     ccs use <account>        switch that provider's login to an account
-    ccs pin [<account>]      start a session confined to one account, leaving
+    ccs pin [claude|codex] [<account>]
+                             start a session confined to one account, leaving
                              every other session on the account in use
     ccs add                  choose Claude Code or Codex, then log in and stash
                              another account without disturbing the one in use
@@ -47,7 +48,8 @@ USAGE
     ccs session --help       registration, labels, queue, inbox and replies
 
     <account> is a slug, an email, an unambiguous prefix of either, or the
-    index shown by `ccs ls`. Without one, `ccs pin` asks.
+    index shown by `ccs ls`. Without one, `ccs pin` asks. Name a provider
+    before the account to resolve an email shared by Claude and Codex.
 
     Provider menus require a terminal. Scripts adding accounts must select
     --claude or --codex. JSON/piped status shows both by default; piped
@@ -104,6 +106,7 @@ pub enum Cmd {
         provider: Option<Provider>,
     },
     Pin {
+        provider: Option<Provider>,
         target: Option<String>,
         args: Vec<String>,
     },
@@ -256,7 +259,19 @@ pub fn parse<I: Iterator<Item = String>>(args: I) -> Result<Cmd> {
         }
         "pin" | "confine" => {
             let (mine, forwarded) = forwarded(&args[1..]);
-            Ok(Cmd::Pin { target: positional(mine), args: forwarded })
+            if mine.iter().any(|arg| arg.starts_with('-')) {
+                bail!("usage: ccs pin [claude|codex] [<account>] [-- <client args>]");
+            }
+            let provider = match mine.first().map(String::as_str) {
+                Some("claude") => Some(Provider::Claude),
+                Some("codex") => Some(Provider::Codex),
+                _ => None,
+            };
+            let target = mine.get(usize::from(provider.is_some())).cloned();
+            if mine.len() > 1 + usize::from(provider.is_some()) {
+                bail!("usage: ccs pin [claude|codex] [<account>] [-- <client args>]");
+            }
+            Ok(Cmd::Pin { provider, target, args: forwarded })
         }
         "rm" | "remove" | "forget" => {
             let Some(target) = positional(&args[1..]) else {
@@ -485,7 +500,8 @@ mod tests {
 
     #[test]
     fn pin_without_a_target_asks_rather_than_failing() {
-        let Cmd::Pin { target, args } = parsed(&["pin"]) else { panic!("not a pin") };
+        let Cmd::Pin { provider, target, args } = parsed(&["pin"]) else { panic!("not a pin") };
+        assert_eq!(provider, None);
         assert_eq!(target, None);
         assert!(args.is_empty());
     }
@@ -498,7 +514,8 @@ mod tests {
 
     #[test]
     fn pin_hands_everything_after_a_double_dash_to_claude_code() {
-        let Cmd::Pin { target, args } = parsed(&["pin", "work", "--", "--continue", "-p", "hi"])
+        let Cmd::Pin { target, args, .. } =
+            parsed(&["pin", "work", "--", "--continue", "-p", "hi"])
         else {
             panic!("not a pin")
         };
@@ -508,11 +525,30 @@ mod tests {
 
     #[test]
     fn a_forwarded_flag_is_never_mistaken_for_the_target() {
-        let Cmd::Pin { target, args } = parsed(&["pin", "--", "resume"]) else {
+        let Cmd::Pin { target, args, .. } = parsed(&["pin", "--", "resume"]) else {
             panic!("not a pin")
         };
         assert_eq!(target, None);
         assert_eq!(args, ["resume"]);
+    }
+
+    #[test]
+    fn pin_accepts_a_provider_before_an_optional_account() {
+        assert!(matches!(
+            parsed(&["pin", "claude", "shared@example.com"]),
+            Cmd::Pin { provider: Some(Provider::Claude), target: Some(target), .. }
+                if target == "shared@example.com"
+        ));
+        assert!(matches!(
+            parsed(&["pin", "codex"]),
+            Cmd::Pin { provider: Some(Provider::Codex), target: None, .. }
+        ));
+        assert!(matches!(
+            parsed(&["pin", "codex", "shared@example.com", "--", "resume"]),
+            Cmd::Pin { provider: Some(Provider::Codex), target: Some(target), args }
+                if target == "shared@example.com" && args == ["resume"]
+        ));
+        assert!(parse(["pin", "claude", "hong", "extra"].map(String::from).into_iter()).is_err());
     }
 
     #[test]

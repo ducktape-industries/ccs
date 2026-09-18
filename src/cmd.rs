@@ -1300,7 +1300,12 @@ pub fn pick(ctx: &Ctx) -> Result<()> {
 ///
 /// Nothing outside the pen is touched, so every other session stays on the
 /// account in use and a later `ccs use` leaves this one where it is.
-pub fn pin(ctx: &Ctx, needle: Option<&str>, args: &[String]) -> Result<()> {
+pub fn pin(
+    ctx: &Ctx,
+    provider: Option<Provider>,
+    needle: Option<&str>,
+    args: &[String],
+) -> Result<()> {
     let mut accounts = stashed(ctx)?;
     let live = identify_live(ctx, &accounts)?;
     reconcile(ctx, &mut accounts, &live)?;
@@ -1308,8 +1313,24 @@ pub fn pin(ctx: &Ctx, needle: Option<&str>, args: &[String]) -> Result<()> {
     // Named outright, the account is taken at its word and the session starts
     // without a round trip; the picker is where usage is shopped for.
     let target = match needle {
-        Some(needle) => stash::resolve(&accounts, needle)?.clone(),
+        Some(needle) => match provider {
+            Some(provider) => {
+                let slug = pinned(&accounts, provider, needle)?;
+                accounts
+                    .iter()
+                    .find(|a| a.slug == slug)
+                    .context("resolved account missing")?
+                    .clone()
+            }
+            None => stash::resolve(&accounts, needle)?.clone(),
+        },
         None => {
+            if let Some(provider) = provider {
+                accounts.retain(|a| a.account.provider == provider);
+                if accounts.is_empty() {
+                    bail!("no accounts stashed for {provider}");
+                }
+            }
             let Some(chosen) = choose(ctx, &mut accounts, Verb::Launch)? else { return Ok(()) };
             chosen
         }

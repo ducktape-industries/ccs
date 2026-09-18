@@ -337,9 +337,12 @@ you want this terminal on the work account and everything else left alone. That
 is `ccs pin`:
 
 ```sh
-ccs pin                     # pick from the table, then launch
-ccs pin work                # skip the picker
-ccs pin work -- --continue  # anything after `--` is handed to Claude Code
+ccs pin                            # pick from the table, then launch
+ccs pin work                       # skip the picker
+ccs pin claude                     # pick only among Claude accounts
+ccs pin claude shared@example.com  # resolve this email among Claude accounts
+ccs pin codex shared@example.com   # resolve the same email among Codex accounts
+ccs pin work -- --continue         # anything after `--` is handed to Claude Code
 ```
 
 It picks an account the same way `ccs` does, then starts Claude Code on it —
@@ -617,7 +620,7 @@ painted, so only the percentages are as old as the footer says.
 | `ccs` | the picker |
 | `ccs ls` | every stashed account and what it has left |
 | `ccs use <account>` | switch that provider's login |
-| `ccs pin [<account>]` | start a session confined to one account |
+| `ccs pin [claude\|codex] [<account>]` | start a session confined to one account; optionally narrow the provider |
 | `ccs add` | choose a provider, then log in and stash another account |
 | `ccs add --current` | choose a provider and stash its current login |
 | `ccs rm <account>` | forget a stashed account |
@@ -629,8 +632,9 @@ painted, so only the percentages are as old as the footer says.
 | `ccs serve --key` | choose whose gateway key to print |
 
 `<account>` is a slug, an email, an unambiguous prefix of either, or the index from
-`ccs ls`. `ccs pin` without one opens the picker; `ccs use` without one is an
-error rather than a guess.
+`ccs ls`. `ccs pin` without an account opens the picker; naming `claude` or
+`codex` first limits that picker or email lookup to the provider. `ccs use`
+without one is an error rather than a guess.
 
 `-f`/`--force` switches even into an account with nothing left. `--json` on `ls`
 and `status` gives you the same data for scripts; `status` keeps the shape it
