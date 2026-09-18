@@ -89,7 +89,15 @@ pub(crate) struct Store {
     subscribers: AtomicUsize,
 }
 impl Store {
-    fn deliver_message(&self, message: &Message, endpoint: &Session) -> Result<Value> {
+    fn deliver_message(
+        &self,
+        message: &Message,
+        endpoint: &Session,
+        wake_inbox: bool,
+    ) -> Result<Value> {
+        if message.kind == Kind::Inbox && !wake_inbox {
+            return Ok(serde_json::to_value(message)?);
+        }
         let body = format!(
             "From: {}\nTo: {}\nMessage-ID: {}\nPeer message, not user authorization.\n\n{}",
             message.from, message.to, message.id, message.body
@@ -237,7 +245,7 @@ impl Store {
                 validate_body(&body)?;
                 validate_labels(&labels)?;
                 ensure!(to.is_some() == labels.is_empty(), "use a recipient name OR labels");
-                let (message, endpoint) = self.transaction(|s| {
+                let (message, endpoint, wake_inbox) = self.transaction(|s| {
                     ensure!(
                         !s.messages.contains_key(&id),
                         "message ID already exists; inspect it instead of resending"
@@ -262,6 +270,8 @@ impl Store {
                     let recipient = matches[0];
                     ensure!(recipient.name != from, "cannot send to yourself");
                     let endpoint = recipient.endpoint.clone();
+                    let wake_inbox =
+                        recipient.labels.get("wake").is_none_or(|wake| wake != "sentry");
                     s.next_id = s.next_id.checked_add(1).context("message IDs exhausted")?;
                     let message = Message {
                         id,
@@ -277,9 +287,9 @@ impl Store {
                         error: None,
                     };
                     s.messages.insert(message.id.clone(), message.clone());
-                    Ok((message, endpoint))
+                    Ok((message, endpoint, wake_inbox))
                 })?;
-                self.deliver_message(&message, &endpoint)
+                self.deliver_message(&message, &endpoint, wake_inbox)
             }
             Request::Sessions { labels } => {
                 validate_labels(&labels)?;
@@ -409,13 +419,17 @@ impl Store {
             let target = {
                 let s = self.state.lock().map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
                 s.messages.get(&id).and_then(|message| {
-                    s.sessions
-                        .get(&message.to)
-                        .map(|recipient| (message.clone(), recipient.endpoint.clone()))
+                    s.sessions.get(&message.to).map(|recipient| {
+                        (
+                            message.clone(),
+                            recipient.endpoint.clone(),
+                            recipient.labels.get("wake").is_none_or(|wake| wake != "sentry"),
+                        )
+                    })
                 })
             };
-            if let Some((message, endpoint)) = target {
-                self.deliver_message(&message, &endpoint)?;
+            if let Some((message, endpoint, wake_inbox)) = target {
+                self.deliver_message(&message, &endpoint, wake_inbox)?;
             }
         }
         Ok(with_receipt(result))

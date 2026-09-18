@@ -46,7 +46,8 @@ and `--codex` options remain aliases. The current stored JSON format is unchange
 
 Inbox storage, labels, name exclusivity, queue correlation, history, HTTP/SSE and
 GPUI do not need provider-specific changes. Inbox messages stay in CCS until
-acknowledged; both inbox and queue sends invoke `deliver`. The delivered body
+acknowledged; inbox sends invoke `deliver` unless the recipient has `wake=sentry`,
+while queue sends always invoke it. The delivered body
 includes the message ID; the recipient replies through the common CCS API.
 Replies and reads trigger the same streams for every adapter.
 

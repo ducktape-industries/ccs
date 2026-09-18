@@ -45,12 +45,17 @@ with tempfile.TemporaryDirectory(prefix='ccs-msg-') as tmp:
         assert 'unknown adapter' in run('session', 'register', 'unknown', '--adapter', 'unimplemented', ok=False)
         assert 'choose one' in run('session', 'register', 'ambiguous', '--adapter', 'codex', '--claude', ok=False)
         run('session', 'register', 'bob', '--codex', '--label', 'role=manager', '--label', 'repo=ui', session='bob')
+        run('session', 'register', 'chief', '--codex', '--label', 'role=chief', '--label', 'wake=sentry', session='chief')
         assert len(run('sessions', '--label', 'role=manager')) == 2
         assert run('sessions', '--label', 'repo=ui')[0]['name'] == 'bob'
         run('session', 'label', 'bob', '--label', 'repo=web')
         assert run('sessions', '--label', 'repo=ui') == []
         assert 'exactly one' in run('inbox', 'send', '--label', 'role=manager', '--message', 'ambiguous', ok=False)
         assert 'exactly one' in run('inbox', 'send', 'missing', '--message', 'missing', ok=False)
+        silent = run('inbox', 'send', 'chief', '--message', 'sentry will digest this')
+        assert silent['status'] == 'pending' and not (root / 'delivered').exists()
+        urgent = run('queue', 'chief', '--message', 'urgent direct wake', '--timeout', '1', ok=False)
+        assert 'timed out' in urgent and 'urgent direct wake' in (root / 'delivered').read_text()
         m = run('inbox', 'send', '--label', 'repo=web', '--message', 'review later')
         assert m['receipt']['stored'] is True and m['receipt']['read'] is False
         assert m['receipt']['unread_for_ms'] >= 0
@@ -71,6 +76,10 @@ with tempfile.TemporaryDirectory(prefix='ccs-msg-') as tmp:
         answer = run('inbox')['messages'][0]
         assert answer['reply_to'] == question['id'] and answer['body'] == 'async answer'
         run('inbox', 'ack', answer['id'])
+        chief_question = run('inbox', 'send', 'bob', '--message', 'chief asks quietly', session='chief')
+        (root / 'delivered').unlink()
+        run('reply', chief_question['id'], '--message', 'reply for sentry', session='bob')
+        assert not (root / 'delivered').exists(), 'reply inbox to sentry-fronted chief must stay silent'
         # Large inboxes remain accessible page by page.
         ids = []
         for _ in range(18):

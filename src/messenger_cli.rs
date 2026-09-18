@@ -14,7 +14,7 @@ ccs session bind <name> [--claude|--codex]    refresh your existing endpoint ato
 ccs session label <name> --label key=value  set labels (empty value removes)
 ccs session remove <name>                explicitly release a registered name
 ccs sessions [--label key=value]         list registered names; labels are ANDed
-ccs inbox send <name> --message <text>    store and wake recipient, without waiting for a reply
+ccs inbox send <name> --message <text>    store and normally wake recipient; wake=sentry stays silent
 ccs inbox [--session <name>] [--limit 20] [--offset 0]             list messages and mark inbox items read
 ccs inbox ack <id>                       mark an inbox message handled
 ccs queue <name> --message <text> [--timeout <seconds>]  send and wait for reply
