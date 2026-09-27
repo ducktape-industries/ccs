@@ -185,9 +185,10 @@ pub fn resolve<'a>(accounts: &'a [Stashed], needle: &str) -> Result<&'a Stashed>
     match matches.as_slice() {
         [one] => Ok(one),
         [] => bail!("no stashed account matches {needle:?}; try `ccs ls`"),
+        // Slugs, not emails: two of them may share one email.
         many => bail!(
-            "{needle:?} is ambiguous between {}",
-            many.iter().map(|s| s.account.email.as_str()).collect::<Vec<_>>().join(", ")
+            "{needle:?} is ambiguous between {}; name the slug",
+            many.iter().map(|s| s.slug.as_str()).collect::<Vec<_>>().join(", ")
         ),
     }
 }
@@ -337,6 +338,11 @@ mod tests {
             resolve(&accounts, "codex-you_at_x.com").expect("by slug").slug,
             "codex-you_at_x.com"
         );
+
+        // A prefix both match names the slugs too, never the one email twice.
+        let error = resolve(&accounts, "you").unwrap_err().to_string();
+        assert!(error.contains("you_at_x.com, codex-you_at_x.com"), "{error}");
+        assert_eq!(resolve(&accounts, "codex-you").expect("by prefix").slug, "codex-you_at_x.com");
     }
 
     /// Two accounts on one email sort the same way every run, Claude first,
