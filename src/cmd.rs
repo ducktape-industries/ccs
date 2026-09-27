@@ -962,8 +962,8 @@ fn codex_binary() -> String {
 /// Ask who some credentials belong to, then write them into the stash.
 ///
 /// Claude is asked over the network; a Codex account names itself in its
-/// identity token. A slug already used by the other provider — the same
-/// email signed up twice — gets the provider's name in front.
+/// identity token. The slug always carries the provider's name in front: one
+/// email is often signed up with both, and only the slug tells them apart.
 fn record(
     ctx: &Ctx,
     provider: Provider,
@@ -1002,15 +1002,7 @@ fn record(
             }
             name.to_string()
         }
-        None => {
-            let plain = stash::slugify(&email);
-            let taken_by_other =
-                held.iter().any(|s| s.slug == plain && s.account.provider != provider);
-            match taken_by_other {
-                true => format!("{provider}-{plain}"),
-                false => plain,
-            }
-        }
+        None => format!("{provider}-{}", stash::slugify(&email)),
     };
     let replaced = held.iter().any(|s| s.slug == slug);
 
@@ -2488,17 +2480,17 @@ mod tests {
         )
         .expect("records");
 
-        assert_eq!(recorded.stashed.slug, "you_at_x.com");
+        assert_eq!(recorded.stashed.slug, "codex-you_at_x.com");
         assert_eq!(recorded.stashed.account.provider, Provider::Codex);
         assert_eq!(recorded.stashed.account.email, "you@x.com");
         assert_eq!(recorded.stashed.account.uuid, "acct-you@x.com");
         assert_eq!(recorded.stashed.account.plan_label(), "codex pro");
-        assert_eq!(fixture.stash.active(Provider::Codex).as_deref(), Some("you_at_x.com"));
+        assert_eq!(fixture.stash.active(Provider::Codex).as_deref(), Some("codex-you_at_x.com"));
         assert_eq!(fixture.stash.active(Provider::Claude), None);
     }
 
-    /// The same email signed up with both providers gets the provider's name
-    /// in front of its slug, and a name given outright never lands on the
+    /// Every derived slug carries its provider, so the same email signed up
+    /// with both never collides, and a name given outright never lands on the
     /// other provider's account — that would spend its refresh token.
     #[test]
     fn a_slug_the_other_provider_holds_is_prefixed_or_refused() {
