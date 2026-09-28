@@ -1,12 +1,19 @@
 //! Pens: per-session configuration directories that differ from the real one in
-//! exactly one file.
+//! two real files.
 //!
 //! Claude Code resolves everything it needs beneath `CLAUDE_CONFIG_DIR` — the
 //! settings, the skills, the plugins, the global configuration file and the
 //! credentials. A pen is a directory of symbolic links back to the real
-//! configuration with one real file, `.credentials.json`, so a session launched
-//! against it carries the whole environment and only the account differs. A
-//! switch elsewhere rewrites the real credentials and leaves the pen's standing.
+//! configuration, with `.credentials.json` and the global configuration file
+//! kept as the pen's own real files, so a session launched against it carries
+//! the whole environment and only the account differs. A switch elsewhere
+//! rewrites the real credentials and leaves the pen's standing.
+//!
+//! The global file is not a link because Claude Code writes its own account
+//! identity into it, at startup and periodically while running. Two pens run
+//! at once for two different accounts; a shared file would have whichever one
+//! saves last decide what both sessions believe they are logged in as. See
+//! `own_global`.
 
 use std::fs::{self, Permissions};
 use std::os::unix::fs::PermissionsExt;
@@ -35,9 +42,21 @@ pub const GLOBAL: &str = ".claude.json";
 
 /// Names the mirror never links, because the pen owns them: the credentials are
 /// the whole point of the pen, the stash would make the pen's copy a mirror of
-/// itself, the write lock is held state rather than configuration, and the
-/// marker belongs to the pen alone.
-const PRIVATE: [&str; 4] = [".credentials.json", "ccs", ".storage-write.lock", MARKER];
+/// itself, the write lock is held state rather than configuration, the marker
+/// belongs to the pen alone, and the global configuration file is handled by
+/// `own_global` — never by the generic per-name link, even when a file of that
+/// name turns up inside the real configuration directory rather than beside it.
+const PRIVATE: [&str; 5] = [".credentials.json", "ccs", ".storage-write.lock", MARKER, GLOBAL];
+
+/// Top-level `.claude.json` keys that name the logged-in account rather than
+/// anything about this machine or its projects. Carrying them into a pen's own
+/// copy would seed it with somebody else's identity, and with a cached
+/// "already fetched" marker that keeps Claude Code from asking again for a
+/// good while — so a freshly split-off pen would go on claiming the account
+/// that happened to write the shared file last. Dropping the keys instead
+/// leaves them absent, which Claude Code already treats as no cached profile
+/// and fills in from this pen's own credentials on its next start.
+const IDENTITY_KEYS: [&str; 2] = ["oauthAccount", "userID"];
 
 /// Where the real configuration lives: the directory Claude Code reads, and the
 /// global configuration file that sits outside it.
@@ -215,7 +234,7 @@ fn mirror(pen: &Path, home: &Home) -> Result<()> {
     for entry in entries {
         let path = entry?.path();
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
-        if PRIVATE.contains(&name) {
+        if PRIVATE.contains(&name) || is_staging_artifact(name) {
             continue;
         }
         link(&path, &pen.join(name))?;
@@ -224,8 +243,9 @@ fn mirror(pen: &Path, home: &Home) -> Result<()> {
     // The global configuration file lives outside the configuration directory
     // and moves inside `CLAUDE_CONFIG_DIR` when that is set, so a pen that did
     // not carry it would start a session with no onboarding and no project it
-    // has ever been trusted in.
-    link(&home.global, &pen.join(GLOBAL))
+    // has ever been trusted in. It is copied rather than linked: see
+    // `own_global`.
+    own_global(pen, &home.global)
 }
 
 fn link(target: &Path, at: &Path) -> Result<()> {
@@ -234,6 +254,62 @@ fn link(target: &Path, at: &Path) -> Result<()> {
     }
     std::os::unix::fs::symlink(target, at)
         .with_context(|| format!("linking {} to {}", at.display(), target.display()))
+}
+
+/// `write_atomic`'s own staging name for a replacement. One is left sitting in
+/// the real configuration for good whenever the write is staged but the
+/// rename that installs it never lands — interrupted or failing outright, this
+/// function does not need to know which. Mirroring it into every pen would
+/// hand each one a copy of whatever `write_atomic` was mid-write on when that
+/// happened, which for `.credentials.json` is a stray copy of a token.
+fn is_staging_artifact(name: &str) -> bool {
+    name.contains(".ccs-") && name.ends_with(".tmp")
+}
+
+/// Give the pen its own copy of the global configuration file instead of a
+/// link to the shared one.
+///
+/// A pen that already owns a real file here is left untouched: re-seeding it
+/// on every `prepare` would erase the identity Claude Code has since written
+/// into it and start the same race over, only now scoped to one pen instead
+/// of all of them. A pen whose file is still a symlink — freshly created, or
+/// built before this existed — is migrated by reading through the link, so
+/// whatever it has been accumulating (trust decisions, onboarding state)
+/// survives the switch to a private copy; only the identity keys are dropped,
+/// since keeping them would carry forward whichever account last wrote the
+/// file that link pointed at.
+fn own_global(pen: &Path, global: &Path) -> Result<()> {
+    let at = pen.join(GLOBAL);
+    let bytes = match at.symlink_metadata() {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            fs::read(&at).with_context(|| format!("reading {}", at.display()))?
+        }
+        Ok(_) => return Ok(()), // already the pen's own file
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => match fs::read(global) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(error).with_context(|| format!("reading {}", global.display()));
+            }
+        },
+        Err(error) => return Err(error).with_context(|| format!("checking {}", at.display())),
+    };
+    write_atomic(&at, &strip_identity(&bytes), FILE_MODE)
+}
+
+/// Drop the identity keys from a `.claude.json` payload. Anything that is not
+/// the JSON object `own_global` expects — including a file predating this
+/// tool's understanding of its shape — is handed back unchanged rather than
+/// risk mangling state Claude Code needs.
+fn strip_identity(bytes: &[u8]) -> Vec<u8> {
+    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+        return bytes.to_vec();
+    };
+    let Some(map) = value.as_object_mut() else { return bytes.to_vec() };
+    for key in IDENTITY_KEYS {
+        map.remove(key);
+    }
+    serde_json::to_vec_pretty(&value).unwrap_or_else(|_| bytes.to_vec())
 }
 
 /// Drop links whose target has gone, so a name the real configuration lost and
@@ -261,8 +337,9 @@ mod tests {
 
     impl Fixture {
         /// A real configuration holding one of everything a pen has to reason
-        /// about: an ordinary file, a directory, a dotfile, and the two names
-        /// the pen owns rather than mirrors.
+        /// about: an ordinary file, a directory, a dotfile, the names inside
+        /// `config` the pen owns rather than mirrors, and a global
+        /// configuration file seeded with identity keys a fresh pen must drop.
         fn new(name: &str) -> Self {
             let root = std::env::temp_dir().join(format!("ccs-pen-{}-{name}", std::process::id()));
             let _ = fs::remove_dir_all(&root);
@@ -276,7 +353,11 @@ mod tests {
             fs::write(config.join(".credentials.json"), b"{}").expect("credentials");
 
             let global = root.join(GLOBAL);
-            fs::write(&global, b"{}").expect("global");
+            fs::write(
+                &global,
+                br#"{"oauthAccount":{"emailAddress":"shared@example.com"},"userID":"shared-uid","projects":{"/tmp/work":{"trusted":true}}}"#,
+            )
+            .expect("global");
 
             Self { root, home: Home { config, global } }
         }
@@ -284,6 +365,10 @@ mod tests {
         fn prepare(&self) -> PathBuf {
             prepare(&self.home, &self.root, "someone_at_example.com").expect("prepare")
         }
+    }
+
+    fn json(path: &Path) -> serde_json::Value {
+        serde_json::from_slice(&fs::read(path).expect("read")).expect("parse")
     }
 
     impl Drop for Fixture {
@@ -386,10 +471,98 @@ mod tests {
     }
 
     #[test]
-    fn a_pen_carries_the_global_configuration_file() {
+    fn a_pen_owns_the_global_configuration_file_rather_than_sharing_it() {
         let fixture = Fixture::new("global");
         let pen = fixture.prepare();
-        assert_eq!(links_to(&pen, GLOBAL).as_deref(), Some(fixture.home.global.as_path()));
+
+        assert_eq!(links_to(&pen, GLOBAL), None, "the global file must not be a symlink");
+        let value = json(&pen.join(GLOBAL));
+        assert_eq!(value.get("oauthAccount"), None, "identity must not be seeded into a new pen");
+        assert_eq!(value.get("userID"), None, "identity must not be seeded into a new pen");
+        assert_eq!(
+            value["projects"]["/tmp/work"]["trusted"], true,
+            "shared state should carry over"
+        );
+    }
+
+    #[test]
+    fn a_name_that_collides_with_the_global_file_inside_the_real_directory_is_not_mirrored() {
+        let fixture = Fixture::new("global-collision");
+        // A file the real config directory happens to hold under the same name
+        // the global configuration file has, distinct from `home.global` itself
+        // — reproducing the drift a broken pen was found with in production.
+        fs::write(
+            fixture.home.config.join(GLOBAL),
+            br#"{"oauthAccount":{"emailAddress":"wrong@example.com"}}"#,
+        )
+        .expect("stray file");
+        let pen = fixture.prepare();
+
+        assert_eq!(links_to(&pen, GLOBAL), None);
+        let value = json(&pen.join(GLOBAL));
+        assert_eq!(value.get("oauthAccount"), None);
+        assert_eq!(
+            value["projects"]["/tmp/work"]["trusted"], true,
+            "seeded from home.global, not the stray file"
+        );
+    }
+
+    #[test]
+    fn a_pens_global_file_already_owned_is_never_reseeded() {
+        let fixture = Fixture::new("global-owned");
+        let pen = fixture.prepare();
+
+        // Claude Code has since logged this pen in and written its own
+        // identity, plus trust for a project no other pen has seen.
+        fs::write(
+            pen.join(GLOBAL),
+            br#"{"oauthAccount":{"emailAddress":"someone@example.com"},"projects":{"/tmp/mine":{"trusted":true}}}"#,
+        )
+        .expect("simulate claude code");
+
+        fixture.prepare();
+
+        let value = json(&pen.join(GLOBAL));
+        assert_eq!(value["oauthAccount"]["emailAddress"], "someone@example.com");
+        assert_eq!(value["projects"]["/tmp/mine"]["trusted"], true);
+    }
+
+    #[test]
+    fn a_symlinked_global_file_from_before_this_fix_is_migrated_to_a_private_copy() {
+        let fixture = Fixture::new("global-migrate");
+        let pen = at(&fixture.root, "someone_at_example.com");
+        fs::create_dir_all(&pen).expect("pen dir");
+
+        // What an old pen looked like: `.claude.json` linked straight at
+        // whatever the shared file was, already carrying another account's
+        // identity and this pen's own accumulated trust.
+        let shared = fixture.root.join("shared.claude.json");
+        fs::write(
+            &shared,
+            br#"{"oauthAccount":{"emailAddress":"other@example.com"},"projects":{"/tmp/accumulated":{"trusted":true}}}"#,
+        )
+        .expect("legacy shared file");
+        std::os::unix::fs::symlink(&shared, pen.join(GLOBAL)).expect("legacy symlink");
+
+        fixture.prepare();
+
+        assert_eq!(links_to(&pen, GLOBAL), None, "the pen must own a private copy now");
+        let value = json(&pen.join(GLOBAL));
+        assert_eq!(value.get("oauthAccount"), None, "the old identity must not carry over");
+        assert_eq!(
+            value["projects"]["/tmp/accumulated"]["trusted"], true,
+            "what this pen accumulated through the old link must survive the migration"
+        );
+    }
+
+    #[test]
+    fn a_stray_write_atomic_tmp_file_is_never_mirrored_into_a_pen() {
+        let fixture = Fixture::new("staging-artifact");
+        fs::write(fixture.home.config.join(".credentials.json.ccs-4242.tmp"), b"leaked-token")
+            .expect("staging artifact");
+
+        let pen = fixture.prepare();
+        assert!(!pen.join(".credentials.json.ccs-4242.tmp").exists());
     }
 
     #[test]
