@@ -37,6 +37,9 @@ On start the command prints the `models.json` snippet to paste into pi:
 { "providers": { "anthropic": { "baseUrl": "http://127.0.0.1:4141", "apiKey": "!ccs serve --key" } } }
 ```
 
+The base snippet lives in `assets/pi-models.json`, embedded at build time;
+only `{port}` is filled in when `serve` starts.
+
 Each provider's entry also carries a `models` array read from the live catalog
 (Claude's `/v1/models`, Codex's `codex/models`). pi merges it into its built-in
 list by id, so models released after pi was built (e.g. `claude-opus-5-5`,

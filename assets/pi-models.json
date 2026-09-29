@@ -1,0 +1,12 @@
+{
+  "providers": {
+    "anthropic": {
+      "baseUrl": "http://127.0.0.1:{port}",
+      "apiKey": "!ccs serve --key"
+    },
+    "openai-codex": {
+      "baseUrl": "http://127.0.0.1:{port}/backend-api",
+      "apiKey": "!ccs serve --key codex"
+    }
+  }
+}
