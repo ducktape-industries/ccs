@@ -144,7 +144,7 @@ with tempfile.TemporaryDirectory(prefix='ccs-msg-') as tmp:
         assert state['sessions']['bob']['endpoint']['thread'] == 'bob-new-thread'
         assert state['sessions']['bob']['labels']['repo'] == 'web'
         bindings = root / 'bindings.json'
-        bindings.write_text(json.dumps({str(root): {'name':'bob','provider':'codex'}}))
+        bindings.write_text(json.dumps({str(root.resolve()): {'name':'bob','provider':'codex'}}))
         hook_env = dict(base, CCS_BIN=binary, CCS_BINDINGS_FILE=str(bindings))
         hook = subprocess.run([sys.executable, str(Path(__file__).with_name('ccs-session-bind.py'))],
             input=json.dumps({'hook_event_name':'SessionStart','cwd':str(root),'session_id':'hook-thread'}),
@@ -192,17 +192,18 @@ with tempfile.TemporaryDirectory(prefix='ccs-msg-') as tmp:
         state = json.loads((root / 'bus/state.json').read_text())
         assert state['sessions']['carol']['endpoint']['socket'] == str(second_socket)
         assert state['sessions']['carol']['labels']['role'] == 'worker'
-        bindings.write_text(json.dumps({str(root): {'name':'carol','provider':'claude','bypass':True}}))
+        bindings.write_text(json.dumps({str(root.resolve()): {'name':'carol','provider':'claude','bypass':True}}))
         hook_script = str(Path(__file__).with_name('ccs-session-bind.py'))
         worker_env = dict(claude_env, CCS_BIN=binary, CCS_BINDINGS_FILE=str(bindings))
         event = json.dumps({'hook_event_name':'SessionStart','cwd':str(root),'session_id':'worker-session'})
+        # A bash named `claude` keeps that argv[0]; a Python re-exec on macOS would not.
+        fake_claude = root / 'claude'
+        fake_claude.symlink_to('/bin/bash')
         for flag in ('-p', '--print'):
-            parent = ('import subprocess,sys; '
-                      'cmd=[sys.argv[3],sys.argv[2]] if sys.argv[1]=="-p" else '
-                      '["/bin/sh","-c","$1 $2; :","hook",sys.argv[3],sys.argv[2]]; '
-                      'p=subprocess.run(cmd, '
-                      'input=sys.stdin.read(),text=True); sys.exit(p.returncode)')
-            worker = subprocess.run(['claude', '-c', parent, flag, hook_script, sys.executable], executable=sys.executable,
+            # `-p` runs the hook as claude's own child, `--print` through a shell;
+            # the trailing `:` keeps either from exec'ing away its parent.
+            parent = '"$1" "$2"; :' if flag == '-p' else '/bin/sh -c \'"$1" "$2"; :\' hook "$1" "$2"; :'
+            worker = subprocess.run([str(fake_claude), '-c', parent, flag, sys.executable, hook_script],
                 input=event, env=worker_env, text=True, capture_output=True, timeout=10)
             assert worker.returncode == 0, repr(worker)
             assert json.loads((root / 'bus/state.json').read_text())['sessions']['carol']['endpoint']['socket'] == str(second_socket)

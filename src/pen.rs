@@ -453,6 +453,9 @@ mod tests {
             fs::write(home.join(name), "source").unwrap();
         }
         let pen = prepare_codex(&home, &fixture.root, "codex-work").unwrap();
+        // The pen links into the resolved home; on macOS the temp directory
+        // sits behind the `/var` -> `/private/var` link.
+        let home = fs::canonicalize(home).unwrap();
         for name in ["config.toml", "AGENTS.md", "skills", "work.config.toml"] {
             assert_eq!(links_to(&pen, name), Some(home.join(name)));
         }

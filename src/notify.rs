@@ -364,6 +364,9 @@ mod tests {
             let _ = fs::remove_dir_all(&root);
             let home = root.join("codex");
             fs::create_dir_all(&home).unwrap();
+            // `Codex::detect` records the resolved home; on macOS the temp
+            // directory sits behind the `/var` -> `/private/var` link.
+            let home = fs::canonicalize(home).unwrap();
             let binary =
                 Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex-queue.sh");
             Self { root, home, binary }
