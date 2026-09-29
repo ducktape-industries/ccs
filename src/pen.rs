@@ -48,15 +48,20 @@ pub const GLOBAL: &str = ".claude.json";
 /// name turns up inside the real configuration directory rather than beside it.
 const PRIVATE: [&str; 5] = [".credentials.json", "ccs", ".storage-write.lock", MARKER, GLOBAL];
 
-/// Top-level `.claude.json` keys that name the logged-in account rather than
-/// anything about this machine or its projects. Carrying them into a pen's own
-/// copy would seed it with somebody else's identity, and with a cached
-/// "already fetched" marker that keeps Claude Code from asking again for a
-/// good while — so a freshly split-off pen would go on claiming the account
-/// that happened to write the shared file last. Dropping the keys instead
-/// leaves them absent, which Claude Code already treats as no cached profile
-/// and fills in from this pen's own credentials on its next start.
-const IDENTITY_KEYS: [&str; 2] = ["oauthAccount", "userID"];
+/// The top-level `.claude.json` key that names the logged-in account. Carrying
+/// it into a pen's own copy would seed the pen with somebody else's identity,
+/// and with a cached "already fetched" marker (`profileFetchedAt`, nested
+/// inside this key) that keeps Claude Code from asking again for up to a day
+/// — so a freshly split-off pen would go on claiming the account that
+/// happened to write the shared file last. Dropping the key instead leaves it
+/// absent, which Claude Code already treats as no cached profile and fills
+/// back in from this pen's own credentials on its next start.
+///
+/// `userID` is deliberately not here: it is a random per-install analytics id
+/// Claude Code generates locally when one is missing, not anything tied to
+/// the logged-in account, so it is not part of the bug this strips and is
+/// left alone.
+const IDENTITY_KEYS: [&str; 1] = ["oauthAccount"];
 
 /// Where the real configuration lives: the directory Claude Code reads, and the
 /// global configuration file that sits outside it.
@@ -89,12 +94,47 @@ pub fn account_of(config_dir: &Path) -> Option<String> {
     Some(serde_json::from_slice::<Marker>(&raw).ok()?.account)
 }
 
+/// Re-mark a pen for a different account: the picker switching a pinned
+/// session, `ccs repair`, and routine reconciliation all funnel through here.
+///
+/// Whenever the account actually changes, the pen's own global configuration
+/// file is stripped of its identity first: it may already hold the *previous*
+/// account's `oauthAccount`, `own_global` never revisits a file it already
+/// owns, and Claude Code otherwise trusts a cached profile for up to a day
+/// (see `IDENTITY_KEYS`). Stripping it here is the one place that covers
+/// every way a pen's marked account can change, instead of chasing each
+/// caller.
 pub fn set_account(config_dir: &Path, account: &str) -> Result<()> {
     let path = config_dir.join(MARKER);
     let raw = fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
     let mut marker: Marker = serde_json::from_slice(&raw)?;
-    marker.account = account.to_string();
+    if marker.account != account {
+        marker.account = account.to_string();
+        forget_identity(config_dir)?;
+    }
     write_atomic(&path, &serde_json::to_vec_pretty(&marker)?, FILE_MODE)
+}
+
+/// Strip the identity keys from a pen's own global configuration file, so the
+/// next Claude Code start in it re-derives them from this pen's own (now
+/// current) credentials instead of continuing to show whichever account it
+/// was marked for before.
+///
+/// A no-op when the pen has no global file yet, or when it is still a symlink
+/// to the shared one rather than a private copy: either way, the next
+/// `prepare` seeds or migrates it, which already strips identity on the way in.
+fn forget_identity(config_dir: &Path) -> Result<()> {
+    let at = config_dir.join(GLOBAL);
+    let bytes = match at.symlink_metadata() {
+        Ok(meta) if !meta.file_type().is_symlink() => {
+            fs::read(&at).with_context(|| format!("reading {}", at.display()))?
+        }
+        _ => return Ok(()),
+    };
+    match strip_identity(&bytes) {
+        Some(seeded) => write_atomic(&at, &seeded, FILE_MODE),
+        None => Ok(()),
+    }
 }
 
 /// Where `slug`'s pen is kept, whether or not one has been built there.
@@ -256,28 +296,35 @@ fn link(target: &Path, at: &Path) -> Result<()> {
         .with_context(|| format!("linking {} to {}", at.display(), target.display()))
 }
 
-/// `write_atomic`'s own staging name for a replacement. One is left sitting in
-/// the real configuration for good whenever the write is staged but the
-/// rename that installs it never lands — interrupted or failing outright, this
-/// function does not need to know which. Mirroring it into every pen would
-/// hand each one a copy of whatever `write_atomic` was mid-write on when that
-/// happened, which for `.credentials.json` is a stray copy of a token.
+/// `write_atomic`'s own staging name for a replacement. `write_atomic` now
+/// cleans this up itself on a failed rename, so nothing new should appear
+/// here; the check stays to keep the handful of copies leaked by builds
+/// before that fix from being symlinked into a pen that has never seen one.
+/// The mirror creates a symlink here, not a copy — inside the same 0700
+/// `~/.claude` tree every pen already sits under, so this adds no reach a
+/// process confined to one pen did not already have; the harm it heads off is
+/// clutter and confusion, a pen full of names that belong to nothing it did.
 fn is_staging_artifact(name: &str) -> bool {
     name.contains(".ccs-") && name.ends_with(".tmp")
 }
 
 /// Give the pen its own copy of the global configuration file instead of a
-/// link to the shared one.
+/// link to the shared one. Three cases:
 ///
-/// A pen that already owns a real file here is left untouched: re-seeding it
-/// on every `prepare` would erase the identity Claude Code has since written
-/// into it and start the same race over, only now scoped to one pen instead
-/// of all of them. A pen whose file is still a symlink — freshly created, or
-/// built before this existed — is migrated by reading through the link, so
-/// whatever it has been accumulating (trust decisions, onboarding state)
-/// survives the switch to a private copy; only the identity keys are dropped,
-/// since keeping them would carry forward whichever account last wrote the
-/// file that link pointed at.
+/// - **No file yet** (a pen `prepare` is building for the first time): seed
+///   it from `global`, the shared file, if one exists.
+/// - **Still a symlink**: only a pen built by a version of `ccs` before this
+///   existed reaches this branch — the mirror loop above never creates this
+///   link any more, since `GLOBAL` is in `PRIVATE`. Migrated by reading
+///   *through* the link, so whatever the pen has been accumulating (trust
+///   decisions, onboarding state) survives the switch to a private copy.
+/// - **Already a real file**: left untouched. Re-seeding it on every
+///   `prepare` would erase the identity Claude Code, or `set_account`'s
+///   `forget_identity`, has since written into it, restarting the same race
+///   scoped to just this one pen.
+///
+/// In the first two cases the identity key is dropped either way, since
+/// keeping it would carry forward whichever account last wrote the source.
 fn own_global(pen: &Path, global: &Path) -> Result<()> {
     let at = pen.join(GLOBAL);
     let bytes = match at.symlink_metadata() {
@@ -294,22 +341,30 @@ fn own_global(pen: &Path, global: &Path) -> Result<()> {
         },
         Err(error) => return Err(error).with_context(|| format!("checking {}", at.display())),
     };
-    write_atomic(&at, &strip_identity(&bytes), FILE_MODE)
+    match strip_identity(&bytes) {
+        Some(seeded) => write_atomic(&at, &seeded, FILE_MODE),
+        // Not a shape this can safely check for identity keys: leave the pen
+        // without a copy sooner than freeze a payload that might still hold
+        // one. The next `prepare` tries again from the same source.
+        None => Ok(()),
+    }
 }
 
-/// Drop the identity keys from a `.claude.json` payload. Anything that is not
-/// the JSON object `own_global` expects — including a file predating this
-/// tool's understanding of its shape — is handed back unchanged rather than
-/// risk mangling state Claude Code needs.
-fn strip_identity(bytes: &[u8]) -> Vec<u8> {
-    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
-        return bytes.to_vec();
-    };
-    let Some(map) = value.as_object_mut() else { return bytes.to_vec() };
+/// Drop the identity key from a `.claude.json` payload, or refuse the payload
+/// outright.
+///
+/// `None` covers invalid JSON and valid JSON that is not an object: either
+/// way there is no reliable way to check whether it holds `oauthAccount`, so
+/// copying it through as-is would risk freezing another account's identity
+/// into a pen's file with no signal anything was wrong. Callers treat `None`
+/// as "nothing usable to seed from this time" rather than installing it.
+fn strip_identity(bytes: &[u8]) -> Option<Vec<u8>> {
+    let mut value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    let map = value.as_object_mut()?;
     for key in IDENTITY_KEYS {
         map.remove(key);
     }
-    serde_json::to_vec_pretty(&value).unwrap_or_else(|_| bytes.to_vec())
+    serde_json::to_vec_pretty(&value).ok()
 }
 
 /// Drop links whose target has gone, so a name the real configuration lost and
@@ -478,7 +533,10 @@ mod tests {
         assert_eq!(links_to(&pen, GLOBAL), None, "the global file must not be a symlink");
         let value = json(&pen.join(GLOBAL));
         assert_eq!(value.get("oauthAccount"), None, "identity must not be seeded into a new pen");
-        assert_eq!(value.get("userID"), None, "identity must not be seeded into a new pen");
+        assert_eq!(
+            value["userID"], "shared-uid",
+            "userID is a per-install analytics id, not account identity; it is not stripped"
+        );
         assert_eq!(
             value["projects"]["/tmp/work"]["trusted"], true,
             "shared state should carry over"
@@ -552,6 +610,90 @@ mod tests {
         assert_eq!(
             value["projects"]["/tmp/accumulated"]["trusted"], true,
             "what this pen accumulated through the old link must survive the migration"
+        );
+    }
+
+    #[test]
+    fn a_global_file_that_is_not_a_json_object_is_never_seeded() {
+        let fixture = Fixture::new("global-invalid");
+        // Truncated JSON: enough to look like an oauthAccount block, not
+        // enough to parse, so there is no reliable way to check it for the
+        // key that must not carry over.
+        fs::write(
+            &fixture.home.global,
+            br#"{"oauthAccount":{"emailAddress":"other@example.com"},"projects":{}"#,
+        )
+        .expect("invalid json");
+
+        let pen = fixture.prepare();
+
+        assert!(!pen.join(GLOBAL).exists(), "an unparseable payload must not be frozen into a pen");
+    }
+
+    #[test]
+    fn a_global_file_that_is_valid_json_but_not_an_object_is_never_seeded() {
+        let fixture = Fixture::new("global-not-object");
+        fs::write(&fixture.home.global, b"[1,2,3]").expect("json array");
+
+        let pen = fixture.prepare();
+
+        assert!(!pen.join(GLOBAL).exists());
+    }
+
+    #[test]
+    fn switching_a_pens_account_in_place_forgets_the_old_identity() {
+        let fixture = Fixture::new("switch-in-place");
+        let pen = fixture.prepare();
+
+        // Claude Code logged this pen in as the account it was pinned to.
+        fs::write(
+            pen.join(GLOBAL),
+            br#"{"oauthAccount":{"emailAddress":"old@example.com"},"projects":{"/tmp/work":{"trusted":true}}}"#,
+        )
+        .expect("simulate claude code");
+
+        // A session running inside the pen switches accounts without moving
+        // to another pen (cmd.rs's switch_to, run inside a pin).
+        set_account(&pen, "new_at_example.com").expect("switch account");
+
+        assert_eq!(account_of(&pen).as_deref(), Some("new_at_example.com"));
+        let value = json(&pen.join(GLOBAL));
+        assert_eq!(value.get("oauthAccount"), None, "the previous account's identity must be gone");
+        assert_eq!(
+            value["projects"]["/tmp/work"]["trusted"], true,
+            "everything else in the file must survive the switch"
+        );
+    }
+
+    #[test]
+    fn setting_the_same_account_again_does_not_touch_the_global_file() {
+        let fixture = Fixture::new("switch-noop");
+        let pen = fixture.prepare();
+        fs::write(pen.join(GLOBAL), br#"{"oauthAccount":{"emailAddress":"me@example.com"}}"#)
+            .expect("simulate claude code");
+
+        set_account(&pen, "someone_at_example.com").expect("same account");
+
+        let value = json(&pen.join(GLOBAL));
+        assert_eq!(value["oauthAccount"]["emailAddress"], "me@example.com");
+    }
+
+    #[test]
+    fn switching_a_symlinked_pens_account_leaves_the_link_for_the_next_prepare() {
+        let fixture = Fixture::new("switch-symlinked");
+        let pen = at(&fixture.root, "someone_at_example.com");
+        fs::create_dir_all(&pen).expect("pen dir");
+        let marker =
+            super::Marker { home: fixture.home.clone(), account: "someone_at_example.com".into() };
+        fs::write(pen.join(super::MARKER), serde_json::to_vec(&marker).unwrap()).expect("marker");
+        std::os::unix::fs::symlink(&fixture.home.global, pen.join(GLOBAL)).expect("legacy symlink");
+
+        set_account(&pen, "new_at_example.com").expect("switch account");
+
+        assert_eq!(
+            links_to(&pen, GLOBAL).as_deref(),
+            Some(fixture.home.global.as_path()),
+            "forget_identity must not touch a file it does not yet own"
         );
     }
 
