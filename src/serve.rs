@@ -817,29 +817,27 @@ pub fn generate_key() -> String {
     format!("{KEY_PREFIX}{hex}")
 }
 
+/// The base `models.json` fragment, checked in so its shape is reviewed like
+/// code; `{port}` is the one thing filled in at run time.
+const PI_TEMPLATE: &str = include_str!("../assets/pi-models.json");
+
 /// The `models.json` fragment that points pi here, with each provider's
 /// catalog merged into pi's own: pi keeps the models it ships with and gains
 /// the ones released since, which it would otherwise refuse to select.
 pub fn pi_config(port: u16, claude: &[CatalogModel], codex: &[CatalogModel]) -> String {
-    let mut anthropic = json!({
-        "baseUrl": format!("http://127.0.0.1:{port}"),
-        "apiKey": "!ccs serve --key"
-    });
-    let mut openai_codex = json!({
-        "baseUrl": format!("http://127.0.0.1:{port}{CODEX_PREFIX}"),
-        "apiKey": "!ccs serve --key codex"
-    });
-    if !claude.is_empty() {
-        anthropic["models"] = claude.iter().map(|m| pi_model(m, "anthropic-messages")).collect();
+    let mut config: serde_json::Value =
+        serde_json::from_str(&PI_TEMPLATE.replace("{port}", &port.to_string()))
+            .expect("the checked-in template is JSON");
+    for (provider, models, api) in [
+        ("anthropic", claude, "anthropic-messages"),
+        ("openai-codex", codex, "openai-codex-responses"),
+    ] {
+        if !models.is_empty() {
+            config["providers"][provider]["models"] =
+                models.iter().map(|m| pi_model(m, api)).collect();
+        }
     }
-    if !codex.is_empty() {
-        openai_codex["models"] =
-            codex.iter().map(|m| pi_model(m, "openai-codex-responses")).collect();
-    }
-    serde_json::to_string_pretty(&json!({
-        "providers": { "anthropic": anthropic, "openai-codex": openai_codex }
-    }))
-    .expect("a literal serialises")
+    serde_json::to_string_pretty(&config).expect("a parsed template serialises")
 }
 
 /// pi's thinking levels past "off"; a level the model has no effort for is
