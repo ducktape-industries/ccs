@@ -28,7 +28,7 @@ use anyhow::{Context, Result, bail};
 use serde_json::json;
 
 use crate::fsx::write_atomic;
-use crate::model::Provider;
+use crate::model::{CatalogModel, Provider};
 
 /// The key file is a credential in its own right: owner-only.
 const KEY_MODE: u32 = 0o600;
@@ -817,21 +817,69 @@ pub fn generate_key() -> String {
     format!("{KEY_PREFIX}{hex}")
 }
 
-/// The `models.json` fragment that points pi here.
-pub fn pi_config(port: u16) -> String {
+/// The `models.json` fragment that points pi here, with each provider's
+/// catalog merged into pi's own: pi keeps the models it ships with and gains
+/// the ones released since, which it would otherwise refuse to select.
+pub fn pi_config(port: u16, claude: &[CatalogModel], codex: &[CatalogModel]) -> String {
+    let mut anthropic = json!({
+        "baseUrl": format!("http://127.0.0.1:{port}"),
+        "apiKey": "!ccs serve --key"
+    });
+    let mut openai_codex = json!({
+        "baseUrl": format!("http://127.0.0.1:{port}{CODEX_PREFIX}"),
+        "apiKey": "!ccs serve --key codex"
+    });
+    if !claude.is_empty() {
+        anthropic["models"] = claude.iter().map(|m| pi_model(m, "anthropic-messages")).collect();
+    }
+    if !codex.is_empty() {
+        openai_codex["models"] =
+            codex.iter().map(|m| pi_model(m, "openai-codex-responses")).collect();
+    }
     serde_json::to_string_pretty(&json!({
-        "providers": {
-            "anthropic": {
-                "baseUrl": format!("http://127.0.0.1:{port}"),
-                "apiKey": "!ccs serve --key"
-            },
-            "openai-codex": {
-                "baseUrl": format!("http://127.0.0.1:{port}{CODEX_PREFIX}"),
-                "apiKey": "!ccs serve --key codex"
-            }
-        }
+        "providers": { "anthropic": anthropic, "openai-codex": openai_codex }
     }))
     .expect("a literal serialises")
+}
+
+/// pi's thinking levels past "off"; a level the model has no effort for is
+/// mapped to null, which pi reads as unsupported and hides.
+const PI_LEVELS: [&str; 6] = ["minimal", "low", "medium", "high", "xhigh", "max"];
+
+/// One catalog model as a pi model definition. Cost stays zero: the gateway
+/// spends a subscription, not metered tokens.
+fn pi_model(model: &CatalogModel, api: &str) -> serde_json::Value {
+    let mut entry = json!({
+        "id": model.id,
+        "name": model.name,
+        "api": api,
+        "reasoning": !model.efforts.is_empty(),
+        "input": if model.images { json!(["text", "image"]) } else { json!(["text"]) },
+        "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+        "contextWindow": model.context_window,
+        "maxTokens": model.max_tokens,
+    });
+    if !model.efforts.is_empty() {
+        entry["thinkingLevelMap"] = PI_LEVELS
+            .iter()
+            .map(|level| {
+                let effort = model.efforts.iter().find(|e| e == level);
+                (level.to_string(), effort.map_or(serde_json::Value::Null, |e| json!(e)))
+            })
+            .collect::<serde_json::Map<_, _>>()
+            .into();
+    }
+    let mut compat = serde_json::Map::new();
+    if model.adaptive {
+        compat.insert("forceAdaptiveThinking".into(), true.into());
+    }
+    if model.strict_tools {
+        compat.insert("supportsStrictTools".into(), true.into());
+    }
+    if !compat.is_empty() {
+        entry["compat"] = compat.into();
+    }
+    entry
 }
 
 #[cfg(test)]
@@ -1680,7 +1728,7 @@ mod tests {
 
     #[test]
     fn the_snippet_points_pi_at_this_port_and_at_the_key_command() {
-        let snippet = pi_config(4141);
+        let snippet = pi_config(4141, &[], &[]);
         let parsed: serde_json::Value = serde_json::from_str(&snippet).expect("json");
         assert_eq!(parsed["providers"]["anthropic"]["baseUrl"], "http://127.0.0.1:4141");
         assert_eq!(parsed["providers"]["anthropic"]["apiKey"], "!ccs serve --key");
@@ -1689,5 +1737,59 @@ mod tests {
             "http://127.0.0.1:4141/backend-api"
         );
         assert_eq!(parsed["providers"]["openai-codex"]["apiKey"], "!ccs serve --key codex");
+    }
+
+    #[test]
+    fn the_snippet_teaches_pi_the_models_it_was_built_without() {
+        let opus = CatalogModel {
+            id: "claude-opus-9".into(),
+            name: "Claude Opus 9".into(),
+            context_window: 1_000_000,
+            max_tokens: 128_000,
+            images: true,
+            efforts: vec!["low".into(), "medium".into(), "high".into(), "max".into()],
+            adaptive: true,
+            strict_tools: true,
+        };
+        let sol = CatalogModel {
+            id: "gpt-9-sol".into(),
+            name: "GPT-9-Sol".into(),
+            context_window: 272_000,
+            max_tokens: 128_000,
+            images: false,
+            efforts: vec!["low".into(), "ultra".into()],
+            adaptive: false,
+            strict_tools: false,
+        };
+        let parsed: serde_json::Value =
+            serde_json::from_str(&pi_config(4141, &[opus], &[sol])).expect("json");
+        let claude = &parsed["providers"]["anthropic"]["models"][0];
+        assert_eq!(claude["id"], "claude-opus-9");
+        assert_eq!(claude["api"], "anthropic-messages");
+        assert_eq!(claude["contextWindow"], 1_000_000);
+        assert_eq!(claude["input"], json!(["text", "image"]));
+        assert_eq!(claude["reasoning"], true);
+        assert_eq!(claude["thinkingLevelMap"]["max"], "max");
+        assert!(claude["thinkingLevelMap"]["xhigh"].is_null());
+        assert_eq!(
+            claude["compat"],
+            json!({"forceAdaptiveThinking": true, "supportsStrictTools": true})
+        );
+        let codex = &parsed["providers"]["openai-codex"]["models"][0];
+        assert_eq!(codex["id"], "gpt-9-sol");
+        assert_eq!(codex["api"], "openai-codex-responses");
+        assert_eq!(codex["input"], json!(["text"]));
+        assert_eq!(codex["thinkingLevelMap"]["low"], "low");
+        assert!(codex.get("compat").is_none());
+        // The keys and ports are what they always were.
+        assert_eq!(parsed["providers"]["openai-codex"]["apiKey"], "!ccs serve --key codex");
+    }
+
+    #[test]
+    fn a_catalog_that_could_not_be_read_leaves_pi_its_own_models() {
+        let parsed: serde_json::Value =
+            serde_json::from_str(&pi_config(4141, &[], &[])).expect("json");
+        assert!(parsed["providers"]["anthropic"].get("models").is_none());
+        assert!(parsed["providers"]["openai-codex"].get("models").is_none());
     }
 }

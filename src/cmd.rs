@@ -659,6 +659,12 @@ pub fn refresh_readings(ctx: &Ctx) -> Result<Vec<Cached>> {
 
 /// Provider-native catalog shared by the GUI and terminal route editors.
 pub fn model_ids(ctx: &Ctx, provider: Provider) -> Result<Vec<String>> {
+    Ok(model_catalog(ctx, provider)?.into_iter().map(|m| m.id).collect())
+}
+
+/// The provider's catalog as the account in use sees it, with what each
+/// model can do.
+pub fn model_catalog(ctx: &Ctx, provider: Provider) -> Result<Vec<crate::model::CatalogModel>> {
     let active = ctx.stash.active(provider);
     let account = ctx
         .stash
@@ -671,7 +677,7 @@ pub fn model_ids(ctx: &Ctx, provider: Provider) -> Result<Vec<String>> {
     };
     let oauth = &account.account.oauth;
     match provider {
-        Provider::Claude => ctx.api.models(&oauth.access_token),
+        Provider::Claude => ctx.api.catalog(&oauth.access_token),
         Provider::Codex => {
             let cache = std::fs::read(ctx.codex.dir().join("models_cache.json"))
                 .ok()
@@ -682,7 +688,7 @@ pub fn model_ids(ctx: &Ctx, provider: Provider) -> Result<Vec<String>> {
                 .filter(|v| !v.trim().is_empty())
                 .context("Open Codex once to initialize its model catalog, then Refresh")?;
             let account_id = oauth.account_id().context("Codex account ID is missing")?;
-            ctx.codex_api.models(&oauth.access_token, account_id, version)
+            ctx.codex_api.catalog(&oauth.access_token, account_id, version)
         }
     }
 }
@@ -1228,7 +1234,16 @@ pub fn serve(ctx: &Ctx, port: u16, rotate: &[String]) -> Result<()> {
     if !pool.is_empty() {
         println!("{} falling over to {} when it is limited", stamp(), pool.join(", "));
     }
-    println!("paste into pi's models.json:\n{}", serve::pi_config(port));
+    // pi only offers the models it was built knowing; the catalogs name the
+    // ones released since. Without them the snippet still routes what pi has.
+    let catalog = |provider| {
+        model_catalog(ctx, provider).unwrap_or_else(|e| {
+            eprintln!("{} no {provider} models for the snippet: {e:#}", stamp());
+            vec![]
+        })
+    };
+    let snippet = serve::pi_config(port, &catalog(Provider::Claude), &catalog(Provider::Codex));
+    println!("paste into pi's models.json:\n{snippet}");
 
     let (asks, inbox) = std::sync::mpsc::channel();
     serve::listen(listener, keys, asks);

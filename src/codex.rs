@@ -21,7 +21,7 @@ use serde_json::{Map, Value, json};
 use crate::api::Refreshed;
 use crate::fsx::write_atomic;
 use crate::model::{
-    Limit, LimitModel, LimitScope, ModelAvailability, Oauth, UsageResponse, now_ms,
+    CatalogModel, Limit, LimitModel, LimitScope, ModelAvailability, Oauth, UsageResponse, now_ms,
 };
 
 /// Codex CLI's own OAuth client, which its refresh tokens were minted for.
@@ -474,6 +474,16 @@ impl Client {
         account_id: &str,
         client_version: &str,
     ) -> Result<Vec<String>> {
+        Ok(self.catalog(token, account_id, client_version)?.into_iter().map(|m| m.id).collect())
+    }
+
+    /// The catalog with what each listed model can do.
+    pub fn catalog(
+        &self,
+        token: &str,
+        account_id: &str,
+        client_version: &str,
+    ) -> Result<Vec<CatalogModel>> {
         let mut response = self
             .agent
             .get("https://chatgpt.com/backend-api/codex/models")
@@ -486,7 +496,7 @@ impl Client {
             bail!("Codex models returned {}", response.status().as_u16());
         }
         let catalog: Models = response.body_mut().read_json().context("parsing Codex models")?;
-        Ok(catalog.visible_ids())
+        Ok(catalog.visible())
     }
 }
 
@@ -499,20 +509,57 @@ struct Models {
 struct ModelOption {
     slug: String,
     visibility: String,
+    #[serde(default)]
+    display_name: Option<String>,
+    #[serde(default)]
+    context_window: Option<u64>,
+    #[serde(default)]
+    supported_reasoning_levels: Vec<ReasoningLevel>,
+    #[serde(default)]
+    input_modalities: Vec<String>,
 }
 
+#[derive(Deserialize)]
+struct ReasoningLevel {
+    effort: String,
+}
+
+/// The catalog names no output cap; this is what Codex models take.
+const CODEX_MAX_TOKENS: u64 = 128_000;
+
 impl Models {
-    fn visible_ids(self) -> Vec<String> {
-        let mut ids = vec![];
+    fn visible(self) -> Vec<CatalogModel> {
+        let mut models: Vec<CatalogModel> = vec![];
         for model in self.models {
             if model.visibility == "list"
                 && !model.slug.trim().is_empty()
-                && !ids.contains(&model.slug)
+                && !models.iter().any(|m| m.id == model.slug)
             {
-                ids.push(model.slug);
+                models.push(CatalogModel {
+                    name: model
+                        .display_name
+                        .filter(|n| !n.is_empty())
+                        .unwrap_or(model.slug.clone()),
+                    context_window: model.context_window.unwrap_or(272_000),
+                    max_tokens: CODEX_MAX_TOKENS,
+                    images: model.input_modalities.iter().any(|m| m == "image"),
+                    efforts: model
+                        .supported_reasoning_levels
+                        .into_iter()
+                        .map(|l| l.effort)
+                        .collect(),
+                    adaptive: false,
+                    strict_tools: false,
+                    id: model.slug,
+                });
             }
         }
-        ids
+        models
+    }
+
+    #[cfg(test)]
+    fn visible_ids(self) -> Vec<String> {
+        self.visible().into_iter().map(|m| m.id).collect()
     }
 }
 
@@ -528,6 +575,17 @@ fn catalog_preserves_wire_ids_and_filters_hidden_models() {
     .unwrap();
     assert_eq!(catalog.visible_ids(), ["new-model-v9"]);
     assert!(serde_json::from_str::<Models>("{}").is_err());
+
+    let described: Models = serde_json::from_str(
+        r#"{"models":[{"slug":"gpt-new","visibility":"list","display_name":"GPT New",
+        "context_window":272000,"input_modalities":["text","image"],
+        "supported_reasoning_levels":[{"effort":"low","description":"x"},{"effort":"ultra"}]}]}"#,
+    )
+    .unwrap();
+    let model = &described.visible()[0];
+    assert_eq!((model.name.as_str(), model.context_window), ("GPT New", 272_000));
+    assert_eq!(model.efforts, ["low", "ultra"]);
+    assert!(model.images);
 }
 
 /// Fold a refresh into the credentials: the new pair, the identity token

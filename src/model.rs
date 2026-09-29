@@ -48,6 +48,24 @@ impl Provider {
     }
 }
 
+/// One model as a provider's own catalog describes it: enough for a client
+/// that has never heard of it to offer it, size its context and pick an effort.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CatalogModel {
+    /// The wire id, exactly as the API takes it.
+    pub id: String,
+    pub name: String,
+    pub context_window: u64,
+    pub max_tokens: u64,
+    pub images: bool,
+    /// Reasoning efforts the model takes, in the provider's own spelling;
+    /// empty for a model that does not reason.
+    pub efforts: Vec<String>,
+    /// Thinking is adaptive only: effort, never a token budget.
+    pub adaptive: bool,
+    pub strict_tools: bool,
+}
+
 impl fmt::Display for Provider {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {

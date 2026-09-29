@@ -37,6 +37,12 @@ On start the command prints the `models.json` snippet to paste into pi:
 { "providers": { "anthropic": { "baseUrl": "http://127.0.0.1:4141", "apiKey": "!ccs serve --key" } } }
 ```
 
+Each provider's entry also carries a `models` array read from the live catalog
+(Claude's `/v1/models`, Codex's `codex/models`). pi merges it into its built-in
+list by id, so models released after pi was built (e.g. `claude-opus-5-5`,
+`claude-sonnet-5-5`, `gpt-6-sol`) become selectable. If a catalog cannot be
+read the array is left out and pi keeps only its own models.
+
 ## Gateway key
 
 `<stash root>/gateway.key`, mode 0600, created on first use with the form

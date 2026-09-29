@@ -7,7 +7,7 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::json;
 
-use crate::model::{Oauth, Profile, UsageResponse, now_ms};
+use crate::model::{CatalogModel, Oauth, Profile, UsageResponse, now_ms};
 
 const API_BASE: &str = "https://api.anthropic.com";
 const TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
@@ -87,7 +87,12 @@ impl Api {
 
     /// Exact wire IDs from the provider catalog, following its pagination.
     pub fn models(&self, token: &str) -> Result<Vec<String>> {
-        let mut ids = Vec::new();
+        Ok(self.catalog(token)?.into_iter().map(|m| m.id).collect())
+    }
+
+    /// The catalog with what each model can do, following its pagination.
+    pub fn catalog(&self, token: &str) -> Result<Vec<CatalogModel>> {
+        let mut models: Vec<CatalogModel> = Vec::new();
         let mut after = String::new();
         loop {
             let mut request = self
@@ -107,12 +112,12 @@ impl Api {
             let page: ModelPage =
                 response.body_mut().read_json().context("parsing Claude models")?;
             for model in page.data {
-                if !model.id.is_empty() && !ids.contains(&model.id) {
-                    ids.push(model.id);
+                if !model.id.is_empty() && !models.iter().any(|m| m.id == model.id) {
+                    models.push(model.into());
                 }
             }
             if !page.has_more {
-                return Ok(ids);
+                return Ok(models);
             }
             let next = page.last_id.context("Claude models omitted the next page cursor")?;
             if next.is_empty() || next == after {
@@ -189,14 +194,54 @@ impl Api {
 
 #[derive(Deserialize)]
 struct ModelPage {
-    data: Vec<ModelId>,
+    data: Vec<ModelEntry>,
     has_more: bool,
     last_id: Option<String>,
 }
 
 #[derive(Deserialize)]
-struct ModelId {
+struct ModelEntry {
     id: String,
+    #[serde(default)]
+    display_name: Option<String>,
+    #[serde(default)]
+    max_input_tokens: Option<u64>,
+    #[serde(default)]
+    max_tokens: Option<u64>,
+    /// Read loosely: a capability the API adds later must not break the list.
+    #[serde(default)]
+    capabilities: serde_json::Value,
+}
+
+/// Efforts in the order the API names them, weakest first.
+const EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
+
+impl From<ModelEntry> for CatalogModel {
+    fn from(entry: ModelEntry) -> Self {
+        let caps = &entry.capabilities;
+        let supported = |path: &[&str]| {
+            path.iter().fold(caps, |v, key| &v[*key])["supported"].as_bool().unwrap_or(false)
+        };
+        let efforts = match supported(&["effort"]) {
+            true => EFFORTS
+                .iter()
+                .filter(|e| supported(&["effort", e]))
+                .map(|e| e.to_string())
+                .collect(),
+            false => vec![],
+        };
+        let adaptive = supported(&["thinking", "types", "adaptive"]);
+        Self {
+            name: entry.display_name.filter(|n| !n.is_empty()).unwrap_or_else(|| entry.id.clone()),
+            context_window: entry.max_input_tokens.unwrap_or(200_000),
+            max_tokens: entry.max_tokens.unwrap_or(32_000),
+            images: supported(&["image_input"]),
+            efforts,
+            adaptive,
+            strict_tools: supported(&["structured_outputs"]),
+            id: entry.id,
+        }
+    }
 }
 
 /// Fold refreshed tokens into a credential blob, preserving every field the
@@ -241,6 +286,32 @@ mod tests {
             subscription_type: Some("max".into()),
             extra,
         }
+    }
+
+    #[test]
+    fn a_catalog_entry_carries_what_the_model_can_do() {
+        let page: ModelPage = serde_json::from_str(
+            r#"{"has_more":false,"data":[
+            {"id":"claude-new-9","display_name":"Claude New 9","max_input_tokens":1000000,
+             "max_tokens":128000,"capabilities":{
+               "effort":{"supported":true,"low":{"supported":true},"medium":{"supported":true},
+                         "high":{"supported":true},"xhigh":{"supported":false},"max":{"supported":true}},
+               "image_input":{"supported":true},"structured_outputs":{"supported":true},
+               "thinking":{"supported":true,"types":{"adaptive":{"supported":true}}},
+               "something_new":{"supported":true}}},
+            {"id":"claude-bare"}
+        ]}"#,
+        )
+        .unwrap();
+        let mut models = page.data.into_iter().map(CatalogModel::from);
+        let new = models.next().unwrap();
+        assert_eq!(new.name, "Claude New 9");
+        assert_eq!((new.context_window, new.max_tokens), (1_000_000, 128_000));
+        assert_eq!(new.efforts, ["low", "medium", "high", "max"]);
+        assert!(new.images && new.adaptive && new.strict_tools);
+        let bare = models.next().unwrap();
+        assert_eq!(bare.name, "claude-bare");
+        assert!(bare.efforts.is_empty() && !bare.adaptive && !bare.images);
     }
 
     #[test]
