@@ -35,9 +35,62 @@ pub fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
         return Err(e);
     }
 
-    fs::rename(&tmp, path).with_context(|| format!("installing {}", path.display()))?;
+    if let Err(e) = fs::rename(&tmp, path) {
+        // The rename is what makes the staged file the real one; failing to
+        // land it is exactly as much a failure as failing to write it, and
+        // leaving the stage behind would leak whatever `bytes` held under a
+        // name every pen's mirror otherwise has to know to skip.
+        let _ = fs::remove_file(&tmp);
+        return Err(e).with_context(|| format!("installing {}", path.display()));
+    }
     // Durability of the rename itself. Best-effort: it has already taken effect
     // for every reader by this point.
     let _ = File::open(dir).and_then(|d| d.sync_all());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// A private root per test, so concurrently running tests never share a path.
+    fn temp(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("ccs-fsx-{}-{name}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("dir");
+        dir
+    }
+
+    #[test]
+    fn a_failed_rename_does_not_leave_the_staged_file_behind() {
+        let dir = temp("rename-fails");
+        // A directory already sits where the write wants to land; renaming a
+        // regular file onto an existing directory fails.
+        let path = dir.join("target");
+        fs::create_dir(&path).expect("occupy the target");
+
+        assert!(write_atomic(&path, b"data", 0o600).is_err());
+
+        let staged = fs::read_dir(&dir)
+            .expect("read dir")
+            .flatten()
+            .any(|entry| entry.file_name().to_string_lossy().contains(".ccs-"));
+        assert!(!staged, "a failed rename must not leave its staged file behind");
+    }
+
+    #[test]
+    fn a_successful_write_lands_at_the_path_with_the_given_mode() {
+        let dir = temp("success");
+        let path = dir.join("target");
+
+        write_atomic(&path, b"data", 0o600).expect("write");
+
+        assert_eq!(fs::read(&path).expect("read"), b"data");
+        assert_eq!(fs::metadata(&path).expect("meta").permissions().mode() & 0o777, 0o600);
+        assert!(
+            fs::read_dir(&dir).expect("read dir").flatten().count() == 1,
+            "no staged file should remain beside a successful write"
+        );
+    }
 }
